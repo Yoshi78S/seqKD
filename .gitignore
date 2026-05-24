@@ -1,0 +1,24 @@
+# --- Experiment outputs (heavy, machine-generated, not for VCS) ---
+src/output/
+output/
+
+# --- Python caches ---
+__pycache__/
+*.py[cod]
+*.so
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# --- Virtual envs ---
+.venv/
+venv/
+env/
+
+# --- Misc ---
+*.log
+*.tmp
