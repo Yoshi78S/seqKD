@@ -118,6 +118,62 @@ def parse_args():
     parser.add_argument("--lambda_kd", default=1.0, type=float)
     parser.add_argument("--kd_temperature", default=2.0, type=float)
 
+    # Adaptive ranking distillation (kd_mode=adaptive_rank): L = L_rec + lambda_kd * L_pred^adapt.
+    # No HS-KD. Teacher attention is temperature-manipulated into an order target
+    # (sharpened) and a set target (flattened); a per-sample order-dependence rho
+    # (pre-residual last-position attention entropy) interpolates them at the
+    # score level; the top-K ranking is distilled via a Plackett-Luce loss
+    # (rank-only -> invariant to student hidden dim).
+    parser.add_argument("--rank_beta", default=1.0, type=float,
+                        help="rank_naive: position-weight shape w=softmax(-rank/beta). "
+                             "Large beta -> ~uniform (most naive); small -> top-concentrated.")
+    parser.add_argument("--kd_mode", default="kl",
+                        choices=["kl", "adaptive_rank", "adaptive_rank_v2",
+                                 "adaptive_rank_comp", "rank_naive"],
+                        help="kl = current KL pred-KD (+ optional HS-KD); "
+                             "adaptive_rank = v1 (attention-temperature targets, deprecated); "
+                             "adaptive_rank_v2 = pre/post-residual interpolation (diagnosed inert); "
+                             "adaptive_rank_comp = complementary distillation "
+                             "(main PL on z_ord + rho-gated complement from z_set); "
+                             "rank_naive = RD-style pointwise ranking distillation.")
+    # Complementary distillation (kd_mode=adaptive_rank_comp).
+    parser.add_argument("--comp_beta", default=0.5, type=float,
+                        help="weight of the complement term.")
+    parser.add_argument("--comp_k", default=10, type=int,
+                        help="top-K for the complement set (z_set rescues that z_ord drops).")
+    parser.add_argument("--comp_use_hinge", action="store_true",
+                        help="complement loss: hinge relu(margin - s) instead of -logsigmoid(s).")
+    parser.add_argument("--comp_margin", default=0.0, type=float,
+                        help="hinge margin (only when --comp_use_hinge).")
+    parser.add_argument("--gate_fixed", default=-1.0, type=float,
+                        help="ablation: -1 = adaptive gate (1+cos)/2; else gate = 1 - gate_fixed "
+                             "(gate_fixed=1.0 -> gate 0 = complement off = pure ranking KD; "
+                             "gate_fixed=0.0 -> gate 1 = uniform complement).")
+    parser.add_argument("--tau_ord", default=0.5, type=float,
+                        help="adaptive_rank (v1 only): attention temperature for the "
+                             "order/sharpened teacher target (<1 sharpens attention).")
+    parser.add_argument("--tau_set", default=2.0, type=float,
+                        help="adaptive_rank (v1 only): attention temperature for the "
+                             "set/flattened teacher target (>1 flattens attention).")
+    parser.add_argument("--rank_k", default=50, type=int,
+                        help="top-K for the Plackett-Luce ranking loss (v1 & v2).")
+    parser.add_argument("--rho_measure", default="cos",
+                        choices=["entropy", "cos", "jsd"],
+                        help="order-dependence measure. v1: entropy (pre-residual attn "
+                             "entropy). v2: cos (1 - cos(h_pre, h_post) at last position) "
+                             "or jsd (JSD(softmax(z_ord), softmax(z_set))).")
+    parser.add_argument("--teacher_pre_path", default="route1",
+                        choices=["route1", "route2"],
+                        help="adaptive_rank_v2: how z_set is built from the pre-residual "
+                             "representation. route1 = final-block residual+LN skipped, "
+                             "flowed through FFN->readout (z_ord = normal teacher). "
+                             "route2 = h_pre / h_post dotted directly with item_emb "
+                             "(symmetric, fallback if route1's z_set degrades).")
+    parser.add_argument("--rho_fixed", default=-1.0, type=float,
+                        help="adaptive_rank_v2 ablation: -1 = adaptive rho (default); "
+                             "1.0 = z_ord only (post-residual); 0.0 = z_set only "
+                             "(pre-residual). For the (b)/(c) comparison conditions.")
+
     # Hidden-state KD args
     parser.add_argument("--do_hs_distill", action="store_true",
                         help="Enable hidden-state KD (requires BSARec teacher + GRU4Rec student).")
@@ -148,6 +204,36 @@ def parse_args():
                         help="KDStudent: replace StudentBlock × N with a "
                              "single nn.GRU(num_layers=N). Implies no FFN, no "
                              "block-internal LN, no HS-KD compatibility.")
+
+    # KDStudent v2 ablation flags (only meaningful with model_type=kdstudent_v2)
+    parser.add_argument("--abl_no_conv", action="store_true",
+                        help="v2 only: drop the Linear→CausalConv1D in front "
+                             "of the GRU.")
+    parser.add_argument("--abl_no_gate", action="store_true",
+                        help="v2 only: drop the SelectiveGate (uses raw GRU "
+                             "output directly).")
+    parser.add_argument("--abl_no_gated_mlp", action="store_true",
+                        help="v2 only: drop the GatedMLP (uses identity in "
+                             "its place, still with residual + LN).")
+
+    # KDStudent v3 (FreqMamba) ablation flags (model_type=kdstudent_v3)
+    parser.add_argument("--abl_no_freq", action="store_true",
+                        help="v3 only: drop the frequency branch (pure Mamba; "
+                             "alpha is ignored).")
+    parser.add_argument("--abl_mamba_residual", action="store_true",
+                        help="v3 only: re-add the fixed `+ x` residual on the "
+                             "Mamba branch (tests the residual-dominance claim).")
+
+    # Context-Direction Decorrelation (CDD) loss args
+    parser.add_argument("--lambda_cdd", default=0.0, type=float,
+                        help="Weight for the CDD loss. 0 disables it. CDD is "
+                             "only computed in KDStudentDistillTrainer (i.e., "
+                             "model_type=kdstudent or kdstudent_v2 with "
+                             "--do_hs_distill).")
+    parser.add_argument("--cdd_alpha", default=0.5, type=float,
+                        help="Balance between L_align (context direction) and "
+                             "L_uniform (representation spread) in CDD: "
+                             "L_CDD = alpha * L_align + (1 - alpha) * L_uniform.")
 
     # Teacher architecture overrides — used only to build the teacher.
     # If left as -1 / None we copy the student's value.

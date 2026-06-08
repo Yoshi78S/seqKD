@@ -4,7 +4,10 @@ import torch
 import numpy as np
 
 from model import MODEL_DICT
-from trainers import Trainer, DistillTrainer, HiddenStateDistillTrainer, KDStudentDistillTrainer
+from trainers import (Trainer, DistillTrainer, HiddenStateDistillTrainer,
+                      KDStudentDistillTrainer, AdaptiveRankingDistillTrainer,
+                      AdaptiveRankingV2Trainer, AdaptiveRankingCompTrainer,
+                      RankNaiveDistillTrainer)
 from utils import EarlyStopping, check_path, set_seed, parse_args, set_logger, make_teacher_args
 from dataset import get_seq_dic, get_dataloder, get_rating_matrix
 
@@ -60,8 +63,36 @@ def main():
         teacher.load_state_dict(state)
         logger.info(f"[Teacher] {args.teacher_type} loaded from {args.teacher_ckpt}")
 
-        if args.do_hs_distill:
-            if args.model_type.lower() == 'kdstudent':
+        if getattr(args, 'kd_mode', 'kl') == 'rank_naive':
+            # RD-style naive pointwise ranking distillation.
+            trainer = RankNaiveDistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'adaptive_rank_comp':
+            # Complementary distillation: main PL on z_ord + rho-gated complement.
+            trainer = AdaptiveRankingCompTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'adaptive_rank_v2':
+            # Adaptive ranking distillation v2 (pre/post-residual interpolation).
+            trainer = AdaptiveRankingV2Trainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'adaptive_rank':
+            # Adaptive ranking distillation v1 (attention-temperature, deprecated).
+            trainer = AdaptiveRankingDistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif args.do_hs_distill:
+            if args.model_type.lower() in ('kdstudent', 'kdstudent_v2', 'kdstudent_v3'):
                 trainer = KDStudentDistillTrainer(
                     student, teacher,
                     train_dataloader, eval_dataloader, test_dataloader,

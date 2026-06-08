@@ -23,6 +23,9 @@ class StudentBlock(nn.Module):
             batch_first=True,
             bias=False,
         )
+        # `hs_hook_target` exposes the module whose forward output is the
+        # block's "hidden state" for HS-KD. For v1 this is the GRU.
+        self.hs_hook_target = self.gru
         self.gru_dropout = nn.Dropout(args.hidden_dropout_prob)
         if self.use_block_ln:
             self.gru_layernorm = LayerNorm(args.hidden_size, eps=1e-12)
