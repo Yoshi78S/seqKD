@@ -1,4 +1,5 @@
 import math
+import os
 import time
 import tqdm
 import torch
@@ -939,3 +940,722 @@ class RankNaiveDistillTrainer(DistillTrainer):
         l_rank = -(w.unsqueeze(0) * F.logsigmoid(s)).sum(dim=1).mean()
 
         return l_rec + self.lambda_kd * l_rank
+
+
+# ── Conditional-IB corrective distillation (CEB term: beta * I(ell; h | y)) ──
+
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, g):
+        return g.neg() * ctx.lambd, None
+
+
+def grad_reverse(x, lambd):
+    return GradReverse.apply(x, lambd)
+
+
+class LastItemCritic(nn.Module):
+    """q_theta(ell | h, y): predicts the last-item id from (h, E_y)."""
+    def __init__(self, d, n_items, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2 * d, hidden), nn.GELU(),
+            nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, n_items),
+        )
+
+    def forward(self, h, e_y):
+        return self.net(torch.cat([h, e_y], dim=-1))
+
+
+class CMIDistillTrainer(DistillTrainer):
+    """Conditional-IB corrective distillation.
+
+        L = L_rec + lambda_kd * L_PL + cmi_beta * L_CEB,  L_CEB estimates I(ell; h | y)
+
+    Base distillation is PL listwise ranking on the NORMAL teacher's top-K (z_ord)
+    — the adopted method (NOT KL). The CEB term penalizes last-item (ell)
+    information in the student readout h that is NOT explained by the target y
+    (conditioning on y auto-gates: useful last-item info is kept). Teacher is used
+    only for L_PL; the CEB term uses y only as the "noise definition". Critic and y
+    are TRAIN-only — eval/predict never see them (G4).
+
+    estimators (--cmi_estimator):
+      none  : L_CEB = 0  (== pure PL base; the G1 reference)
+      linear: penalize h's component along E_ell minus its E_y projection  (no critic)
+      adv   : gradient-reversal critic q(ell|h,y); GRL strength = cmi_beta  (G1: beta=0
+              -> zero student grad from CEB -> identical to PL). critic in student optim.
+      club  : conditional CLUB upper bound on I(ell;h|y); critic by MLE (separate optim).
+    """
+
+    def __init__(self, student_model, teacher_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args, logger):
+        super().__init__(student_model, teacher_model,
+                         train_dataloader, eval_dataloader, test_dataloader, args, logger)
+        self.cmi_estimator = getattr(args, 'cmi_estimator', 'none')
+        self.cmi_beta = getattr(args, 'cmi_beta', 0.0)
+        self.rank_k = getattr(args, 'rank_k', 50)
+        self.critic = None
+        self._leak_log = []
+        self._samey_rate = float('nan')
+        d, n_items = args.hidden_size, args.item_size
+        if self.cmi_estimator in ('adv', 'club'):
+            self.critic = LastItemCritic(d, n_items, getattr(args, 'cmi_hidden', 256))
+            if self.cuda_condition:
+                self.critic.cuda()
+            betas = (self.args.adam_beta1, self.args.adam_beta2)
+            if self.cmi_estimator == 'adv':
+                # critic learns jointly with the student via GRL -> one optimizer
+                self.optim = Adam(list(self.model.parameters()) + list(self.critic.parameters()),
+                                  lr=self.args.lr, betas=betas, weight_decay=self.args.weight_decay)
+            else:  # club: critic trained by MLE in a separate optimizer
+                self.opt_critic = Adam(self.critic.parameters(),
+                                       lr=getattr(args, 'cmi_critic_lr', 1e-3))
+                self.cmi_critic_steps = getattr(args, 'cmi_critic_steps', 1)
+        logger.info(f"CMI config: estimator={self.cmi_estimator}, beta={self.cmi_beta}, "
+                    f"rank_k={self.rank_k}, base=PL")
+
+    def _pl_term(self, student_logits, z_ord):
+        k = min(self.rank_k, z_ord.size(1))
+        topk = torch.topk(z_ord, k, dim=1).indices
+        return AdaptiveRankingDistillTrainer._plackett_luce_loss(
+            torch.gather(student_logits, 1, topk))
+
+    def _compute_train_loss(self, batch):
+        user_ids, input_ids, answers, neg_answer, same_target = batch
+        ell = input_ids[:, -1]
+        E = self.model.item_embeddings.weight
+        h = self.model.predict(input_ids, user_ids)[:, -1, :]          # [B, d]
+        student_logits = torch.matmul(h, E.transpose(0, 1))
+        l_rec = F.cross_entropy(student_logits, answers)
+        z_ord = self._teacher_logits(input_ids, user_ids)              # normal teacher
+        loss = l_rec + self.lambda_kd * self._pl_term(student_logits, z_ord)
+
+        est = self.cmi_estimator
+        if est == 'linear':
+            ey = F.normalize(E[answers].detach(), dim=-1)
+            el = E[ell].detach()
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            l_ceb = ((h * el_perp).sum(-1) ** 2).mean()
+            loss = loss + self.cmi_beta * l_ceb
+            self._leak_log.append(float(l_ceb.detach()))
+        elif est == 'adv':
+            logits_c = self.critic(grad_reverse(h, self.cmi_beta), E[answers].detach())
+            l_ceb = F.cross_entropy(logits_c, ell)   # critic minimizes; student maximizes (GRL)
+            loss = loss + l_ceb
+            self._leak_log.append(float(l_ceb.detach()))
+        elif est == 'club':
+            for _ in range(self.cmi_critic_steps):
+                lc = self.critic(h.detach(), E[answers].detach())
+                Lc = F.cross_entropy(lc, ell)
+                self.opt_critic.zero_grad(); Lc.backward(); self.opt_critic.step()
+            lc2 = self.critic(h, E[answers].detach())
+            logp = F.log_softmax(lc2, dim=-1)
+            pos = logp.gather(1, ell[:, None]).squeeze(1)
+            logp_ell = logp[:, ell]                                    # [B,B]
+            same_y = (answers[:, None] == answers[None, :]).float()
+            cnt = same_y.sum(1)
+            use_all = (cnt <= 1).float()[:, None]
+            w = same_y * (1 - use_all) + torch.ones_like(same_y) * use_all
+            neg = (w * logp_ell).sum(1) / w.sum(1)
+            l_club = (pos - neg).mean()
+            loss = loss + self.cmi_beta * l_club
+            self._leak_log.append(float(l_club.detach()))
+            self._samey_rate = float((cnt > 1).float().mean())
+        return loss
+
+    def train(self, epoch):
+        self._leak_log = []
+        super().train(epoch)
+        if self._leak_log:
+            msg = f"CMI leak/CEB epoch {epoch}: {np.mean(self._leak_log):.4f}"
+            if self.cmi_estimator == 'club':
+                msg += f"  same_y_rate={self._samey_rate:.3f}"
+            self.logger.info(msg)
+
+    @torch.no_grad()
+    def cmi_finalize(self, csv_path):
+        """Post-train metrics (test set): HR@10/NDCG@10, HRLI@1, cos_last, and
+        HR@10 by leak tercile (advantaged=low leak / disadvantaged=high leak).
+        Uses the in-memory critic (adv/club) or the linear proxy. Writes one CSV row."""
+        import csv as _csv
+        self.model.eval()
+        if self.critic is not None:
+            self.critic.eval()
+        E = self.model.item_embeddings.weight
+        trm = self.args.test_rating_matrix
+        leaks, hrli, coslast, rankf = [], [], [], []
+        for batch in self.test_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            user_ids, input_ids, answers, _, _ = batch
+            ell = input_ids[:, -1]
+            h = self.model.predict(input_ids, user_ids)[:, -1, :]
+            logits = torch.matmul(h, E.transpose(0, 1))
+            hrli.append((logits.argmax(1) == ell).float().cpu().numpy())
+            coslast.append(F.cosine_similarity(h, E[ell], dim=-1).cpu().numpy())
+            if self.cmi_estimator in ('adv', 'club'):
+                logp = F.log_softmax(self.critic(h, E[answers]), dim=-1)
+                if self.cmi_estimator == 'adv':
+                    leak = logp.gather(1, ell[:, None]).squeeze(1)
+                else:
+                    pos = logp.gather(1, ell[:, None]).squeeze(1)
+                    sy = (answers[:, None] == answers[None, :]).float(); cnt = sy.sum(1)
+                    ua = (cnt <= 1).float()[:, None]; w = sy * (1 - ua) + torch.ones_like(sy) * ua
+                    leak = pos - (w * logp[:, ell]).sum(1) / w.sum(1)
+            else:
+                ey = F.normalize(E[answers], dim=-1); el = E[ell]
+                el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+                leak = (h * el_perp).sum(-1) ** 2
+            leaks.append(leak.cpu().numpy())
+            rp = logits.cpu().numpy().copy(); bidx = user_ids.cpu().numpy(); y = answers.cpu().numpy()
+            try: rp[trm[bidx].toarray() > 0] = 0
+            except Exception: rp = rp[:, :-1]; rp[trm[bidx].toarray() > 0] = 0
+            rankf.append((rp > rp[np.arange(len(rp)), y][:, None]).sum(1) + 1)
+        leaks = np.concatenate(leaks); hrli = np.concatenate(hrli)
+        coslast = np.concatenate(coslast); rankf = np.concatenate(rankf)
+        hit10 = (rankf <= 10).astype(float)
+        ndcg10 = np.where(rankf <= 10, 1.0 / np.log2(rankf + 1), 0.0)
+        q1, q2 = np.quantile(leaks, [1/3, 2/3])
+        adv_g, dis_g = leaks <= q1, leaks > q2
+        row = {
+            "dataset": self.args.data_name, "estimator": self.cmi_estimator,
+            "beta": self.cmi_beta, "rank_k": self.rank_k, "lambda_pl": self.lambda_kd,
+            "HR@10": round(hit10.mean(), 4), "NDCG@10": round(ndcg10.mean(), 4),
+            "HRLI@1": round(hrli.mean(), 4), "cos_last": round(float(coslast.mean()), 4),
+            "HR@10_adv(lowleak)": round(hit10[adv_g].mean(), 4),
+            "HR@10_dis(highleak)": round(hit10[dis_g].mean(), 4),
+            "leak_train": round(float(np.mean(self._leak_log)) if self._leak_log else 0.0, 4),
+            "samey_rate": round(self._samey_rate, 4) if self.cmi_estimator == 'club' else "",
+        }
+        new = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new: wcsv.writeheader()
+            wcsv.writerow(row)
+        self.logger.info(f"CMI finalize -> {csv_path}: {row}")
+        return row
+
+
+class DebiasDistillTrainer(CMIDistillTrainer):
+    """Gated relative de-bias distillation (kd_mode=debias).
+
+        L = L_rec + lambda_kd * L_PL  (+ lambda_db * L_db   for margin/bpr)
+
+    Replaces the ABSOLUTE repulsion of cmi-linear (shrink h's E_ell component;
+    decoupled from prediction -> leak fell but HR fell too) with a RELATIVE
+    penalty in the prediction's own score space: only the gap of s_ell vs s_y
+    is penalized, gated by w = 1 - cos(E_ell, E_y) (full stop-grad; y==ell ->
+    w=0 -> no penalty). Self-limiting via margin / logsigmoid saturation /
+    softmax normalization.
+
+    Arms (--debias_mode):
+      none         : pure PL baseline (S1 reference; zero extra ops)
+      margin       : L_db = (w * relu(m - (cos(h,E_y) - cos(h,E_ell)))).mean()
+                     --detach_neg: relu((sg(s_ell)+m) - s_y) ("raise y" only)
+      bpr          : L_db = -(w * logsigmoid(s_y_raw - s_ell_raw)).mean(), raw dots,
+                     E columns detached (no gradient leak into the embedding table)
+      logit_margin : train-only: +w*m on the ell column of the CE logits
+                     (L_PL ALWAYS sees the unmodified logits)
+      reweight     : control arm, no ell term: CE_i weighted by (1 + gamma*w)
+
+    Warmup (--db_warmup): early E is near-random -> w~1 indiscriminately, so the
+    de-bias term is disabled for the first db_warmup epochs.
+    Gate embeddings: live student E (detached) by default; --gate_emb_ckpt
+    freezes the gate at that checkpoint's item embeddings.
+    Eval path is untouched (y / w / modified logits never enter valid/test);
+    valid() only ADDs read-only val-HRLI@1 logging. leak (the cmi-linear proxy,
+    unchanged definition) is logged for comparability with the beta sweep.
+    """
+
+    def __init__(self, student_model, teacher_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args, logger):
+        args.cmi_estimator = 'none'   # no critic / no CEB term; PL base only
+        super().__init__(student_model, teacher_model,
+                         train_dataloader, eval_dataloader, test_dataloader, args, logger)
+        self.debias_mode = getattr(args, 'debias_mode', 'none')
+        self.lambda_db = getattr(args, 'lambda_db', 1.0)
+        self.margin_m = getattr(args, 'margin_m', 0.3)
+        self.lm_margin = getattr(args, 'lm_margin', 1.0)
+        self.gamma_rw = getattr(args, 'gamma_rw', 1.0)
+        self.db_warmup = getattr(args, 'db_warmup', 10)
+        self.detach_neg = getattr(args, 'detach_neg', False)
+        self.gate_E = None
+        if getattr(args, 'gate_emb_ckpt', None):
+            state = torch.load(args.gate_emb_ckpt, map_location=self.device)
+            self.gate_E = state['item_embeddings.weight'].to(self.device)
+            logger.info(f"DEBIAS gate frozen from {args.gate_emb_ckpt} "
+                        f"(shape {tuple(self.gate_E.shape)})")
+        self._cur_epoch = 0
+        self._ep = {}
+        self._epoch_csv = os.path.join(args.output_dir, '..', 'results',
+                                       f"{args.train_name}_epochs.csv")
+        os.makedirs(os.path.dirname(self._epoch_csv), exist_ok=True)
+        logger.info(f"DEBIAS config: mode={self.debias_mode}, lambda_db={self.lambda_db}, "
+                    f"margin_m={self.margin_m}, lm_margin={self.lm_margin}, "
+                    f"gamma_rw={self.gamma_rw}, warmup={self.db_warmup}, "
+                    f"detach_neg={self.detach_neg}, base=PL(lam={self.lambda_kd},k={self.rank_k})")
+
+    def _gate(self, ell, answers):
+        """w = 1 - cos(E_ell, E_y), full stop-grad."""
+        with torch.no_grad():
+            Eg = self.gate_E if self.gate_E is not None else self.model.item_embeddings.weight
+            e_l_n = F.normalize(Eg[ell], dim=-1)
+            e_y_n = F.normalize(Eg[answers], dim=-1)
+            return (1.0 - (e_l_n * e_y_n).sum(-1)).clamp(0.0, 1.0)
+
+    def _acc(self, key, val, n=1):
+        s, c = self._ep.get(key, (0.0, 0))
+        self._ep[key] = (s + float(val) * n, c + n)
+
+    def _compute_train_loss(self, batch):
+        user_ids, input_ids, answers, neg_answer, same_target = batch
+        ell = input_ids[:, -1]
+        # Length-1 train prefixes have an ALL-PADDING input (ell==0): there is no
+        # last item, so they get w=0 (no penalty) and are excluded from diagnostics.
+        valid_l = (ell != 0)
+        E = self.model.item_embeddings.weight
+        h = self.model.predict(input_ids, user_ids)[:, -1, :]              # [B, d]
+        logits = torch.matmul(h, E.transpose(0, 1))                        # [B, V]
+        B = logits.size(0)
+        w = self._gate(ell, answers) * valid_l.float()                     # [B], sg
+        active = (self._cur_epoch >= self.db_warmup)
+        mode = self.debias_mode
+
+        # ----- L_rec (logit_margin / reweight modify it; others use plain CE) -----
+        if mode == 'logit_margin' and active and self.lm_margin != 0.0:
+            logits_ce = logits.clone()
+            logits_ce[torch.arange(B, device=logits.device), ell] += w * self.lm_margin
+            l_rec = F.cross_entropy(logits_ce, answers)
+        elif mode == 'reweight' and active and self.gamma_rw != 0.0:
+            ce_i = F.cross_entropy(logits, answers, reduction='none')
+            l_rec = ((1.0 + self.gamma_rw * w) * ce_i).mean()
+        else:
+            l_rec = F.cross_entropy(logits, answers)
+
+        # ----- L_PL: ALWAYS the unmodified logits (S3) -----
+        z_ord = self._teacher_logits(input_ids, user_ids)
+        l_pl = self._pl_term(logits, z_ord)
+        loss = l_rec + self.lambda_kd * l_pl
+
+        # ----- L_db (margin / bpr only) -----
+        l_db = None
+        if mode == 'margin' and active and self.lambda_db != 0.0:
+            h_n = F.normalize(h, dim=-1)                                   # grad flows via h
+            with torch.no_grad():
+                e_l_s = F.normalize(E[ell], dim=-1)
+                e_y_s = F.normalize(E[answers], dim=-1)
+            s_y_c = (h_n * e_y_s).sum(-1)
+            s_l_c = (h_n * e_l_s).sum(-1)
+            if self.detach_neg:
+                l_db = (w * F.relu((s_l_c.detach() + self.margin_m) - s_y_c)).mean()
+            else:
+                l_db = (w * F.relu(self.margin_m - (s_y_c - s_l_c))).mean()
+            loss = loss + self.lambda_db * l_db
+        elif mode == 'bpr' and active and self.lambda_db != 0.0:
+            s_y_r = (h * E[answers].detach()).sum(-1)
+            s_l_r = (h * E[ell].detach()).sum(-1)
+            l_db = -(w * F.logsigmoid(s_y_r - s_l_r)).mean()
+            loss = loss + self.lambda_db * l_db
+
+        # ----- per-epoch diagnostics (no_grad; §5 of the spec; valid rows only) -----
+        with torch.no_grad():
+            hi, lo = (w > 0.5) & valid_l, (w < 0.2) & valid_l
+            sy_r = (h * E[answers]).sum(-1)
+            sl_r = (h * E[ell]).sum(-1)
+            h_nn = F.normalize(h, dim=-1)
+            sy_c = (h_nn * F.normalize(E[answers], dim=-1)).sum(-1)
+            sl_c = (h_nn * F.normalize(E[ell], dim=-1)).sum(-1)
+            ey = F.normalize(E[answers], dim=-1)
+            el = E[ell]
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            leak = ((h * el_perp).sum(-1) ** 2)                            # cmi-linear proxy
+            self._acc('l_rec', l_rec, 1); self._acc('l_pl', l_pl, 1)
+            if l_db is not None:
+                self._acc('l_db', l_db, 1)
+            nv = int(valid_l.sum())
+            if nv > 0:
+                self._acc('w_mean', w[valid_l].mean(), nv)
+                self._acc('w_frac_gt05', hi.float().sum() / nv, nv)
+                self._acc('w_frac_lt02', lo.float().sum() / nv, nv)
+            self._acc('pad_frac', 1.0 - nv / max(B, 1), 1)
+            self._acc('leak', leak.mean(), 1)
+            for tag, g in (('all', valid_l), ('hi', hi), ('lo', lo)):
+                for nm, v in (('s_y_raw', sy_r), ('s_l_raw', sl_r),
+                              ('s_y_cos', sy_c), ('s_l_cos', sl_c)):
+                    vv = v[g]
+                    if vv.numel() > 0:
+                        self._acc(f'{nm}_{tag}', vv.mean(), int(vv.numel()))
+            hist = torch.histc(w[valid_l], bins=10, min=0.0, max=1.0)
+            self._ep['w_hist'] = self._ep.get('w_hist', torch.zeros(10)) + hist.cpu()
+        return loss
+
+    def train(self, epoch):
+        self._cur_epoch = epoch
+        self._ep = {}
+        if epoch == self.db_warmup:
+            self.logger.info(f"DEBIAS term ACTIVATED at epoch {epoch}")
+        Trainer.train(self, epoch)                                         # plain loop
+        m = {k: (v[0] / v[1] if v[1] else float('nan'))
+             for k, v in self._ep.items() if k != 'w_hist'}
+        self.logger.info(
+            f"DEBIAS epoch {epoch} active={epoch >= self.db_warmup} "
+            f"L_rec={m.get('l_rec', float('nan')):.4f} L_PL={m.get('l_pl', float('nan')):.4f} "
+            f"L_db={m.get('l_db', float('nan')):.4f} w_mean={m.get('w_mean', float('nan')):.3f} "
+            f"w>.5={m.get('w_frac_gt05', float('nan')):.3f} "
+            f"w<.2={m.get('w_frac_lt02', float('nan')):.3f} "
+            f"s_y_raw(hi)={m.get('s_y_raw_hi', float('nan')):.4f} "
+            f"s_l_raw(hi)={m.get('s_l_raw_hi', float('nan')):.4f} "
+            f"leak={m.get('leak', float('nan')):.4f}")
+        self._ep_means = m
+
+    @torch.no_grad()
+    def _val_hrli1(self):
+        """Read-only: fraction of val instances whose unmasked top-1 == last input item."""
+        self.model.eval()
+        E = self.model.item_embeddings.weight
+        n_hit, n = 0, 0
+        for batch in self.eval_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            user_ids, input_ids, _, _, _ = batch
+            h = self.model.predict(input_ids, user_ids)[:, -1, :]
+            top1 = torch.matmul(h, E.transpose(0, 1)).argmax(1)
+            n_hit += int((top1 == input_ids[:, -1]).sum())
+            n += input_ids.size(0)
+        return n_hit / max(n, 1)
+
+    def valid(self, epoch):
+        scores, info = super().valid(epoch)                                # protocol untouched
+        if hasattr(self, '_ep_means'):                                     # training loop only
+            import csv as _csv
+            m = self._ep_means
+            row = {'epoch': epoch, 'active': int(epoch >= self.db_warmup)}
+            for k in ('l_rec', 'l_pl', 'l_db', 'w_mean', 'w_frac_gt05', 'w_frac_lt02',
+                      's_y_raw_all', 's_y_raw_hi', 's_y_raw_lo',
+                      's_l_raw_all', 's_l_raw_hi', 's_l_raw_lo',
+                      's_y_cos_all', 's_y_cos_hi', 's_y_cos_lo',
+                      's_l_cos_all', 's_l_cos_hi', 's_l_cos_lo', 'leak'):
+                row[k] = round(m.get(k, float('nan')), 6)
+            row['val_HR10'] = scores[2]
+            row['val_NDCG10'] = scores[3]
+            row['val_HRLI1'] = round(self._val_hrli1(), 4)
+            wh = self._ep.get('w_hist', torch.zeros(10))
+            wh = (wh / wh.sum()).tolist() if wh.sum() > 0 else [float('nan')] * 10
+            for i, v in enumerate(wh):
+                row[f'w_hist{i}'] = round(v, 4)
+            new = not os.path.exists(self._epoch_csv)
+            with open(self._epoch_csv, 'a', newline='') as f:
+                wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new: wcsv.writeheader()
+                wcsv.writerow(row)
+        return scores, info
+
+    @torch.no_grad()
+    def debias_finalize(self, csv_path):
+        """Test-set metrics: HR/NDCG/HRLI/cos_last/leak + HR@10 by w-tercile
+        (lo = advantaged group; over-removal watch) + HR@10 by item-popularity
+        tercile of the TARGET y (train-sequence occurrence counts; popularity-
+        debias confound check). One CSV row + log line."""
+        import csv as _csv
+        from dataset import get_seq_dic
+        self.model.eval()
+        E = self.model.item_embeddings.weight
+        trm = self.args.test_rating_matrix
+        # item popularity = occurrence count in the train part (seq[:-2]) of each user
+        seq_dic, _, _ = get_seq_dic(self.args)
+        pop = np.zeros(self.args.item_size, dtype=np.int64)
+        for seq in seq_dic['user_seq']:
+            for it in seq[:-2]:
+                pop[it] += 1
+        ws, hrli, coslast, leaks, rankf, ypop = [], [], [], [], [], []
+        for batch in self.test_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            user_ids, input_ids, answers, _, _ = batch
+            ell = input_ids[:, -1]
+            h = self.model.predict(input_ids, user_ids)[:, -1, :]
+            logits = torch.matmul(h, E.transpose(0, 1))
+            ws.append(self._gate(ell, answers).cpu().numpy())
+            hrli.append((logits.argmax(1) == ell).float().cpu().numpy())
+            coslast.append(F.cosine_similarity(h, E[ell], dim=-1).cpu().numpy())
+            ey = F.normalize(E[answers], dim=-1); el = E[ell]
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            leaks.append(((h * el_perp).sum(-1) ** 2).cpu().numpy())
+            rp = logits.cpu().numpy().copy()
+            bidx = user_ids.cpu().numpy(); y = answers.cpu().numpy()
+            try: rp[trm[bidx].toarray() > 0] = 0
+            except Exception: rp = rp[:, :-1]; rp[trm[bidx].toarray() > 0] = 0
+            rankf.append((rp > rp[np.arange(len(rp)), y][:, None]).sum(1) + 1)
+            ypop.append(pop[y])
+        ws = np.concatenate(ws); hrli = np.concatenate(hrli)
+        coslast = np.concatenate(coslast); leaks = np.concatenate(leaks)
+        rankf = np.concatenate(rankf); ypop = np.concatenate(ypop)
+        hit10 = (rankf <= 10).astype(float)
+        ndcg10 = np.where(rankf <= 10, 1.0 / np.log2(rankf + 1), 0.0)
+        wq1, wq2 = np.quantile(ws, [1 / 3, 2 / 3])
+        w_lo, w_hi = ws <= wq1, ws > wq2
+        w_mid = ~w_lo & ~w_hi
+        pq1, pq2 = np.quantile(ypop, [1 / 3, 2 / 3])
+        p_lo, p_hi = ypop <= pq1, ypop > pq2
+        p_mid = ~p_lo & ~p_hi
+        m = getattr(self, '_ep_means', {})
+        row = {
+            "dataset": self.args.data_name, "mode": self.debias_mode,
+            "lambda_db": self.lambda_db, "margin_m": self.margin_m,
+            "lm_margin": self.lm_margin, "gamma_rw": self.gamma_rw,
+            "warmup": self.db_warmup, "detach_neg": int(self.detach_neg),
+            "rank_k": self.rank_k, "lambda_pl": self.lambda_kd,
+            "HR@10": round(hit10.mean(), 4), "NDCG@10": round(ndcg10.mean(), 4),
+            "HRLI@1": round(hrli.mean(), 4), "cos_last": round(float(coslast.mean()), 4),
+            "leak_test": round(float(leaks.mean()), 4),
+            "HR@10_w_lo": round(hit10[w_lo].mean(), 4),
+            "HR@10_w_mid": round(hit10[w_mid].mean(), 4) if w_mid.any() else "",
+            "HR@10_w_hi": round(hit10[w_hi].mean(), 4),
+            "HR@10_pop_lo": round(hit10[p_lo].mean(), 4),
+            "HR@10_pop_mid": round(hit10[p_mid].mean(), 4) if p_mid.any() else "",
+            "HR@10_pop_hi": round(hit10[p_hi].mean(), 4),
+            "s_y_raw_hi_final": round(m.get('s_y_raw_hi', float('nan')), 4),
+            "s_l_raw_hi_final": round(m.get('s_l_raw_hi', float('nan')), 4),
+            "w_test_mean": round(float(ws.mean()), 4),
+        }
+        new = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new: wcsv.writeheader()
+            wcsv.writerow(row)
+        self.logger.info(f"DEBIAS finalize -> {csv_path}: {row}")
+        return row
+
+
+class RepDistillTrainer(CMIDistillTrainer):
+    """kappa-corrected relational distillation (kd_mode=rep).
+
+        L = L_rec + lambda_kd * L_PL + lambda_rep * L_rep
+
+    L_rep matches the STUDENT's cosine-similarity structure S = hs_hat @ hs_hat.T
+    to a TEACHER structure T (off-diagonal MSE). Dimension-free (S, T are scalar
+    matrices), so d_s != d_t works unchanged. kappa = d*(1-a) is the teacher's
+    per-instance harmful-dominance score, computed ON THE FLY inside the same
+    no_grad teacher forward already required for PL (zero extra forward cost):
+        d = cos(h_t, E_t[ell]).clamp(0,1), a = cos(E_t[ell], E_t[y]).clamp(0,1)
+        g = h_t - min(kappa, .95) * (h_t . e_l) * e_l   (rank-1 soft removal)
+
+    rep_mode:
+      none          : L_rep = 0 (pure PL baseline, S1 reference)
+      corrected     : T from g_hat (arm A; D3 PASS form)
+      raw           : T from h_t_hat (arm A0, the decisive ablation)
+      pairgate      : T from h_t_hat, pair weights (1-k_i)(1-k_j) (D3-FAIL fallback A)
+      shuffled      : corrected with kappa permuted within batch (placebo C)
+      pairgate_shuf : pairgate with kappa permuted within batch (placebo C)
+
+    Teacher quantities are inside no_grad (frozen teacher) -> structurally
+    stop-grad (asserted, S2). ell==0 rows (length-1 train prefixes) get kappa=0
+    (no correction / weight 1). Eval path untouched; leak (cmi-linear proxy,
+    unchanged definition) logged for comparability.
+    """
+
+    def __init__(self, student_model, teacher_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args, logger):
+        args.cmi_estimator = 'none'
+        super().__init__(student_model, teacher_model,
+                         train_dataloader, eval_dataloader, test_dataloader, args, logger)
+        self.rep_mode = getattr(args, 'rep_mode', 'none')
+        self.lambda_rep = getattr(args, 'lambda_rep', 0.0)
+        self._ep = {}
+        self._epoch_csv = os.path.join(args.output_dir, '..', 'results',
+                                       f"{args.train_name}_epochs.csv")
+        os.makedirs(os.path.dirname(self._epoch_csv), exist_ok=True)
+        logger.info(f"REP config: mode={self.rep_mode}, lambda_rep={self.lambda_rep}, "
+                    f"base=PL(lam={self.lambda_kd},k={self.rank_k})")
+
+    def _acc(self, key, val, n=1):
+        s, c = self._ep.get(key, (0.0, 0))
+        self._ep[key] = (s + float(val) * n, c + n)
+
+    @torch.no_grad()
+    def _teacher_quant(self, input_ids, answers):
+        """h_t, z_ord (PL target), kappa, t_hat (T row vectors per rep_mode)."""
+        E_t = self.teacher.item_embeddings.weight
+        h_t = self.teacher.predict(input_ids, None)[:, -1, :]
+        z_ord = torch.matmul(h_t, E_t.transpose(0, 1))          # == _teacher_logits
+        ell = input_ids[:, -1]
+        e_l = F.normalize(E_t[ell], dim=-1)
+        e_y = F.normalize(E_t[answers], dim=-1)
+        d = (F.normalize(h_t, dim=-1) * e_l).sum(-1).clamp(0, 1)
+        a = (e_l * e_y).sum(-1).clamp(0, 1)
+        kappa = d * (1 - a) * (ell != 0).float()
+        k_eff = kappa
+        if self.rep_mode in ('shuffled', 'pairgate_shuf'):
+            k_eff = kappa[torch.randperm(kappa.size(0), device=kappa.device)]
+        if self.rep_mode in ('corrected', 'shuffled'):
+            p = (h_t * e_l).sum(-1, keepdim=True)
+            g = h_t - k_eff.clamp(max=0.95).unsqueeze(-1) * p * e_l
+            t_hat = g / g.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        else:                                                   # raw / pairgate(+shuf)
+            t_hat = F.normalize(h_t, dim=-1)
+        return z_ord, kappa, k_eff, t_hat
+
+    def _compute_train_loss(self, batch):
+        user_ids, input_ids, answers, neg_answer, same_target = batch
+        E_s = self.model.item_embeddings.weight
+        h_s = self.model.predict(input_ids, user_ids)[:, -1, :]
+        logits = torch.matmul(h_s, E_s.transpose(0, 1))
+        l_rec = F.cross_entropy(logits, answers)
+        z_ord, kappa, k_eff, t_hat = self._teacher_quant(input_ids, answers)
+        l_pl = self._pl_term(logits, z_ord)                     # unmodified logits (S5)
+        loss = l_rec + self.lambda_kd * l_pl
+
+        l_rep = None
+        if self.rep_mode != 'none' and self.lambda_rep != 0.0:
+            assert not t_hat.requires_grad and not k_eff.requires_grad   # S2
+            B = h_s.size(0)
+            hs_hat = F.normalize(h_s, dim=-1)
+            S = hs_hat @ hs_hat.t()
+            T = t_hat @ t_hat.t()
+            mask = ~torch.eye(B, dtype=torch.bool, device=S.device)
+            if self.rep_mode in ('pairgate', 'pairgate_shuf'):
+                w = 1 - k_eff
+                M = (w.unsqueeze(0) * w.unsqueeze(1))[mask]
+                l_rep = (M * ((S - T)[mask] ** 2)).sum() / M.sum().clamp_min(1e-6)
+            else:
+                l_rep = ((S - T)[mask] ** 2).mean()
+            loss = loss + self.lambda_rep * l_rep
+
+        # ----- per-epoch diagnostics (no_grad) -----
+        with torch.no_grad():
+            self._acc('l_rec', l_rec, 1); self._acc('l_pl', l_pl, 1)
+            if l_rep is not None:
+                self._acc('l_rep', l_rep, 1)
+            self._acc('kappa_mean', kappa.mean(), 1)
+            if self.rep_mode != 'none':
+                B = h_s.size(0)
+                hs_hat = F.normalize(h_s, dim=-1)
+                S = (hs_hat @ hs_hat.t())
+                T = (t_hat @ t_hat.t())
+                mask = ~torch.eye(B, dtype=torch.bool, device=S.device)
+                s_off, t_off = S[mask], T[mask]
+                def _corr(x, yv):
+                    if x.numel() < 3:
+                        return float('nan')
+                    xc, yc = x - x.mean(), yv - yv.mean()
+                    return float((xc * yc).sum() /
+                                 (xc.norm() * yc.norm()).clamp_min(1e-9))
+                self._acc('corr_all', _corr(s_off, t_off), 1)
+                hi_i = kappa > 0.5
+                lo_i = kappa < 0.2
+                hi_pair = (hi_i.unsqueeze(0) & hi_i.unsqueeze(1))[mask]
+                lo_pair = (lo_i.unsqueeze(0) & lo_i.unsqueeze(1))[mask]
+                if hi_pair.sum() >= 3:
+                    self._acc('corr_hik', _corr(s_off[hi_pair], t_off[hi_pair]), 1)
+                if lo_pair.sum() >= 3:
+                    self._acc('corr_lok', _corr(s_off[lo_pair], t_off[lo_pair]), 1)
+            ell = input_ids[:, -1]
+            ey = F.normalize(E_s[answers], dim=-1)
+            el = E_s[ell]
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            self._acc('leak', ((h_s * el_perp).sum(-1) ** 2).mean(), 1)
+        return loss
+
+    def train(self, epoch):
+        self._ep = {}
+        Trainer.train(self, epoch)
+        m = {k: (v[0] / v[1] if v[1] else float('nan')) for k, v in self._ep.items()}
+        self.logger.info(
+            f"REP epoch {epoch} L_rec={m.get('l_rec', float('nan')):.4f} "
+            f"L_PL={m.get('l_pl', float('nan')):.4f} L_rep={m.get('l_rep', float('nan')):.6f} "
+            f"corr(S,T)={m.get('corr_all', float('nan')):.4f} "
+            f"corr_hik={m.get('corr_hik', float('nan')):.4f} "
+            f"corr_lok={m.get('corr_lok', float('nan')):.4f} "
+            f"kappa={m.get('kappa_mean', float('nan')):.3f} "
+            f"leak={m.get('leak', float('nan')):.4f}")
+        self._ep_means = m
+
+    def valid(self, epoch):
+        scores, info = super().valid(epoch)
+        if hasattr(self, '_ep_means'):
+            import csv as _csv
+            m = self._ep_means
+            row = {'epoch': epoch}
+            for k in ('l_rec', 'l_pl', 'l_rep', 'corr_all', 'corr_hik', 'corr_lok',
+                      'kappa_mean', 'leak'):
+                row[k] = round(m.get(k, float('nan')), 6)
+            row['val_HR10'] = scores[2]
+            row['val_NDCG10'] = scores[3]
+            new = not os.path.exists(self._epoch_csv)
+            with open(self._epoch_csv, 'a', newline='') as f:
+                wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new: wcsv.writeheader()
+                wcsv.writerow(row)
+        return scores, info
+
+    @torch.no_grad()
+    def rep_finalize(self, csv_path):
+        """Test metrics + kappa-tercile HR (is the gain concentrated in high kappa?)
+        + popularity-tercile HR. One CSV row + log line."""
+        import csv as _csv
+        from dataset import get_seq_dic
+        self.model.eval()
+        E_s = self.model.item_embeddings.weight
+        trm = self.args.test_rating_matrix
+        seq_dic, _, _ = get_seq_dic(self.args)
+        pop = np.zeros(self.args.item_size, dtype=np.int64)
+        for seq in seq_dic['user_seq']:
+            for it in seq[:-2]:
+                pop[it] += 1
+        kaps, hrli, coslast, leaks, rankf, ypop = [], [], [], [], [], []
+        for batch in self.test_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            user_ids, input_ids, answers, _, _ = batch
+            ell = input_ids[:, -1]
+            h = self.model.predict(input_ids, user_ids)[:, -1, :]
+            logits = torch.matmul(h, E_s.transpose(0, 1))
+            _, kappa, _, _ = self._teacher_quant(input_ids, answers)
+            kaps.append(kappa.cpu().numpy())
+            hrli.append((logits.argmax(1) == ell).float().cpu().numpy())
+            coslast.append(F.cosine_similarity(h, E_s[ell], dim=-1).cpu().numpy())
+            ey = F.normalize(E_s[answers], dim=-1); el = E_s[ell]
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            leaks.append(((h * el_perp).sum(-1) ** 2).cpu().numpy())
+            rp = logits.cpu().numpy().copy()
+            bidx = user_ids.cpu().numpy(); y = answers.cpu().numpy()
+            try: rp[trm[bidx].toarray() > 0] = 0
+            except Exception: rp = rp[:, :-1]; rp[trm[bidx].toarray() > 0] = 0
+            rankf.append((rp > rp[np.arange(len(rp)), y][:, None]).sum(1) + 1)
+            ypop.append(pop[y])
+        kaps = np.concatenate(kaps); hrli = np.concatenate(hrli)
+        coslast = np.concatenate(coslast); leaks = np.concatenate(leaks)
+        rankf = np.concatenate(rankf); ypop = np.concatenate(ypop)
+        hit10 = (rankf <= 10).astype(float)
+        ndcg10 = np.where(rankf <= 10, 1.0 / np.log2(rankf + 1), 0.0)
+        kq1, kq2 = np.quantile(kaps, [1 / 3, 2 / 3])
+        k_lo, k_hi = kaps <= kq1, kaps > kq2
+        k_mid = ~k_lo & ~k_hi
+        pq1, pq2 = np.quantile(ypop, [1 / 3, 2 / 3])
+        p_lo, p_hi = ypop <= pq1, ypop > pq2
+        p_mid = ~p_lo & ~p_hi
+        m = getattr(self, '_ep_means', {})
+        row = {
+            "dataset": self.args.data_name, "mode": self.rep_mode,
+            "lambda_rep": self.lambda_rep,
+            "rank_k": self.rank_k, "lambda_pl": self.lambda_kd,
+            "HR@10": round(hit10.mean(), 4), "NDCG@10": round(ndcg10.mean(), 4),
+            "HRLI@1": round(hrli.mean(), 4), "cos_last": round(float(coslast.mean()), 4),
+            "leak_test": round(float(leaks.mean()), 4),
+            "HR@10_k_lo": round(hit10[k_lo].mean(), 4),
+            "HR@10_k_mid": round(hit10[k_mid].mean(), 4) if k_mid.any() else "",
+            "HR@10_k_hi": round(hit10[k_hi].mean(), 4),
+            "HR@10_pop_lo": round(hit10[p_lo].mean(), 4),
+            "HR@10_pop_mid": round(hit10[p_mid].mean(), 4) if p_mid.any() else "",
+            "HR@10_pop_hi": round(hit10[p_hi].mean(), 4),
+            "corr_ST_final": round(m.get('corr_all', float('nan')), 4),
+        }
+        new = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new: wcsv.writeheader()
+            wcsv.writerow(row)
+        self.logger.info(f"REP finalize -> {csv_path}: {row}")
+        return row

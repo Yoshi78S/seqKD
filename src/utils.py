@@ -79,8 +79,9 @@ def parse_args():
     parser.add_argument("--variance", default=5, type=float)
 
     # model args (shared)
-    parser.add_argument("--model_type", default='mlp_student', type=str,
-                        help="mlp_student | sigma | bsarec | duorec | gru4rec | lrurec | fmlprec")
+    parser.add_argument("--model_type", default='kdstudent_v3', type=str,
+                        help="kdstudent_v3 (proposed FreqMamba student) | bsarec "
+                             "(teacher). Older baselines/students are in ../archive/models/.")
     parser.add_argument("--max_seq_length", default=50, type=int)
     parser.add_argument("--hidden_size", default=64, type=int)
     parser.add_argument("--num_hidden_layers", default=2, type=int)
@@ -112,7 +113,7 @@ def parse_args():
     # ===== Knowledge distillation args =====
     parser.add_argument("--do_distill", action="store_true",
                         help="Enable distillation (student is --model_type, teacher is --teacher_type).")
-    parser.add_argument("--teacher_type", default="sigma", type=str)
+    parser.add_argument("--teacher_type", default="bsarec", type=str)
     parser.add_argument("--teacher_ckpt", default=None, type=str,
                         help="Path to teacher .pt checkpoint. Required when --do_distill.")
     parser.add_argument("--lambda_kd", default=1.0, type=float)
@@ -127,15 +128,72 @@ def parse_args():
     parser.add_argument("--rank_beta", default=1.0, type=float,
                         help="rank_naive: position-weight shape w=softmax(-rank/beta). "
                              "Large beta -> ~uniform (most naive); small -> top-concentrated.")
+    # Conditional-IB corrective distillation (kd_mode=cmi): L = L_rec + lambda_kd*L_PL
+    # + cmi_beta * I(ell;h|y). Base distillation = PL (ranking on z_ord top-K).
+    parser.add_argument("--cmi_estimator", default="none",
+                        choices=["none", "linear", "adv", "club"],
+                        help="CEB estimator: none(=pure PL), linear proxy, adversarial GRL, "
+                             "conditional CLUB.")
+    parser.add_argument("--cmi_beta", default=0.0, type=float,
+                        help="weight/GRL-strength of the CEB term (beta=0 -> identical to PL, G1).")
+    parser.add_argument("--cmi_hidden", default=256, type=int,
+                        help="critic hidden size (adv/club).")
+    parser.add_argument("--cmi_critic_lr", default=1e-3, type=float,
+                        help="critic optimizer lr (club).")
+    parser.add_argument("--cmi_critic_steps", default=1, type=int,
+                        help="critic MLE steps per batch (club).")
+    # kappa-corrected relational distillation (kd_mode=rep):
+    # L = L_rec + lambda_kd*L_PL + lambda_rep*L_rep, L_rep = MSE(S, T) off-diagonal,
+    # S = student cos-sim structure, T = teacher structure from kappa-corrected g
+    # (corrected/shuffled), raw h_t (raw), or pair-gated raw (pairgate).
+    # kappa = d*(1-a) computed ON THE FLY from the frozen teacher (no cache).
+    parser.add_argument("--rep_mode", default="none",
+                        choices=["none", "corrected", "raw", "pairgate",
+                                 "shuffled", "pairgate_shuf"],
+                        help="none(=pure PL); corrected = T from kappa-corrected g_hat; "
+                             "raw = T from h_t_hat (ablation A0); pairgate = raw T with "
+                             "(1-kappa_i)(1-kappa_j) pair weights (D3-FAIL fallback); "
+                             "shuffled / pairgate_shuf = kappa permuted within batch (placebo).")
+    parser.add_argument("--lambda_rep", default=0.0, type=float,
+                        help="weight of L_rep (0 -> identical to pure PL baseline).")
     parser.add_argument("--kd_mode", default="kl",
                         choices=["kl", "adaptive_rank", "adaptive_rank_v2",
-                                 "adaptive_rank_comp", "rank_naive"],
+                                 "adaptive_rank_comp", "rank_naive", "cmi", "debias", "rep"],
                         help="kl = current KL pred-KD (+ optional HS-KD); "
                              "adaptive_rank = v1 (attention-temperature targets, deprecated); "
                              "adaptive_rank_v2 = pre/post-residual interpolation (diagnosed inert); "
                              "adaptive_rank_comp = complementary distillation "
                              "(main PL on z_ord + rho-gated complement from z_set); "
-                             "rank_naive = RD-style pointwise ranking distillation.")
+                             "rank_naive = RD-style pointwise ranking distillation; "
+                             "cmi = Conditional-IB corrective distillation (PL base + I(ell;h|y)); "
+                             "debias = gated relative de-bias (PL base + relative s_y-vs-s_ell penalty).")
+    # Gated relative de-bias (kd_mode=debias): L = L_rec + lambda_kd*L_PL + lambda_db*L_db.
+    # Gate w = 1 - cos(E_ell, E_y) (full stop-grad; y==ell -> w=0). Penalty is RELATIVE
+    # (gap of s_ell vs s_y in the prediction's own score space), unlike the absolute
+    # cmi linear repulsion. margin/bpr add L_db; logit_margin/reweight modify L_rec.
+    parser.add_argument("--debias_mode", default="none",
+                        choices=["none", "margin", "bpr", "logit_margin", "reweight"],
+                        help="none(=pure PL baseline); margin = gated pairwise cosine margin; "
+                             "bpr = -logsigmoid(s_y - s_ell) on raw dots; "
+                             "logit_margin = +w*m on the ell logit inside CE (train only); "
+                             "reweight = (1 + gamma*w) per-instance CE weight (control arm, no ell term).")
+    parser.add_argument("--lambda_db", default=1.0, type=float,
+                        help="weight of L_db (margin/bpr only).")
+    parser.add_argument("--margin_m", default=0.3, type=float,
+                        help="margin arm: cosine-scale margin m in [0,1].")
+    parser.add_argument("--lm_margin", default=1.0, type=float,
+                        help="logit_margin arm: logit-scale margin added to the ell column.")
+    parser.add_argument("--gamma_rw", default=1.0, type=float,
+                        help="reweight arm: CE weight = 1 + gamma_rw * w.")
+    parser.add_argument("--db_warmup", default=10, type=int,
+                        help="epochs with the de-bias term disabled (E is near-random early "
+                             "-> w~1 everywhere would push indiscriminately).")
+    parser.add_argument("--detach_neg", action="store_true",
+                        help="margin arm fallback: detach s_ell so only 'raise s_y' can satisfy "
+                             "the margin (anti-destructive-route).")
+    parser.add_argument("--gate_emb_ckpt", default=None, type=str,
+                        help="optional: compute the gate w from this checkpoint's frozen item "
+                             "embeddings instead of the live (drifting) student embeddings.")
     # Complementary distillation (kd_mode=adaptive_rank_comp).
     parser.add_argument("--comp_beta", default=0.5, type=float,
                         help="weight of the complement term.")

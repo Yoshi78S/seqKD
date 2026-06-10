@@ -7,7 +7,8 @@ from model import MODEL_DICT
 from trainers import (Trainer, DistillTrainer, HiddenStateDistillTrainer,
                       KDStudentDistillTrainer, AdaptiveRankingDistillTrainer,
                       AdaptiveRankingV2Trainer, AdaptiveRankingCompTrainer,
-                      RankNaiveDistillTrainer)
+                      RankNaiveDistillTrainer, CMIDistillTrainer, DebiasDistillTrainer,
+                      RepDistillTrainer)
 from utils import EarlyStopping, check_path, set_seed, parse_args, set_logger, make_teacher_args
 from dataset import get_seq_dic, get_dataloder, get_rating_matrix
 
@@ -63,7 +64,28 @@ def main():
         teacher.load_state_dict(state)
         logger.info(f"[Teacher] {args.teacher_type} loaded from {args.teacher_ckpt}")
 
-        if getattr(args, 'kd_mode', 'kl') == 'rank_naive':
+        if getattr(args, 'kd_mode', 'kl') == 'rep':
+            # kappa-corrected relational distillation (PL base + lambda_rep*L_rep).
+            trainer = RepDistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'debias':
+            # Gated relative de-bias distillation (PL base + relative s_y-vs-s_ell penalty).
+            trainer = DebiasDistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'cmi':
+            # Conditional-IB corrective distillation (PL base + beta*I(ell;h|y)).
+            trainer = CMIDistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'rank_naive':
             # RD-style naive pointwise ranking distillation.
             trainer = RankNaiveDistillTrainer(
                 student, teacher,
@@ -163,6 +185,27 @@ def main():
     scores, result_info = trainer.test(best_epoch)
     logger.info(args.train_name)
     logger.info(result_info)
+
+    # CMI: write the per-run analysis row (HR/NDCG/HRLI/cos_last + leak-tercile group HR).
+    if getattr(args, 'kd_mode', 'kl') == 'cmi' and hasattr(trainer, 'cmi_finalize'):
+        res_dir = os.path.join(args.output_dir, '..', 'results')
+        os.makedirs(res_dir, exist_ok=True)
+        csv_path = os.path.join(res_dir, f"cmi_{args.cmi_estimator}_{args.data_name}.csv")
+        trainer.cmi_finalize(csv_path)
+
+    # DEBIAS: per-run row (HR/NDCG/HRLI/leak + w-tercile & popularity-tercile HR).
+    if getattr(args, 'kd_mode', 'kl') == 'debias' and hasattr(trainer, 'debias_finalize'):
+        res_dir = os.path.join(args.output_dir, '..', 'results')
+        os.makedirs(res_dir, exist_ok=True)
+        csv_path = os.path.join(res_dir, f"debias_{args.debias_mode}_{args.data_name}.csv")
+        trainer.debias_finalize(csv_path)
+
+    # REP: per-run row (HR/NDCG/HRLI + kappa-tercile & popularity-tercile HR).
+    if getattr(args, 'kd_mode', 'kl') == 'rep' and hasattr(trainer, 'rep_finalize'):
+        res_dir = os.path.join(args.output_dir, '..', 'results')
+        os.makedirs(res_dir, exist_ok=True)
+        csv_path = os.path.join(res_dir, f"rep_{args.rep_mode}_{args.data_name}.csv")
+        trainer.rep_finalize(csv_path)
 
 
 if __name__ == "__main__":

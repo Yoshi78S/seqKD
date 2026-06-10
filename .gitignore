@@ -1,6 +1,7 @@
 # --- Experiment outputs (heavy, machine-generated, not for VCS) ---
 src/output/
 output/
+*.csv
 
 # --- Python caches ---
 __pycache__/
