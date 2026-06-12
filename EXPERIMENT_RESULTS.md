@@ -263,8 +263,9 @@ hi-κ(k_lo) は改善するが lo-κ(k_hi) が低下し全体 HR は base 未満
 2. shuffled ≈ real は κ の実質信号ではなく list churn が原因と示唆
 3. κ-HRLI 削減は最終的に "HRLI 低下は主にアーキ（Mamba 枝 + α混合）由来" であり蒸留損失では制御困難
 
+4. 残差ラダー（§8）完結: HRLI は残差量に単調追従するが、freq 残差除去は HR も損ない β² 恒等再出現を招く。"残差完全除去" ではなく "Mamba 枝の固定残差除去＋α 混合で freq 残差を (1−α) に抑制" が正確な主張。
+
 **未完了タスク**:
-- `v3freqnores` (abl_no_freq_residual) ×3DS → 3 点ラダー完成のため必要
-- V4DistillTrainer の修正・再設計（現行実装は収束不安定）
+- V4DistillTrainer の再設計（現行実装は収束不安定; 全ケース base 大幅未満）— 優先度低
 
 詳細な失敗記録は [FAILED_KD_METHODS.md](FAILED_KD_METHODS.md) 参照。
