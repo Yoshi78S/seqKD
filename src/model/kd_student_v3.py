@@ -60,6 +60,42 @@ from model._abstract_model import SequentialRecModel
 from model._modules import LayerNorm
 from model.bsarec import FrequencyLayer  # byte-for-byte BSARec frequency branch
 
+
+class StudentFrequencyLayer(nn.Module):
+    """BSARec's FrequencyLayer with an OPTIONAL ablation of its internal fixed
+    residual:  LN(filtered + x)  ->  LN(filtered)   (--abl_no_freq_residual).
+
+    Default (flag off) is byte-identical to bsarec.FrequencyLayer, and the
+    attribute names (sqrt_beta / LayerNorm / out_dropout) match it exactly so
+    state_dict keys are unchanged.
+    Note: even with the residual removed, the filter itself passes an identity
+    component beta^2 * x (filtered = beta^2*x + (1-beta^2)*low_pass), so this
+    ablates the EXPLICIT residual only; the learned beta is reported after
+    training to check for identity re-emergence (beta -> 1).
+    """
+
+    def __init__(self, args):
+        super().__init__()
+        self.out_dropout = nn.Dropout(args.hidden_dropout_prob)
+        self.LayerNorm = LayerNorm(args.hidden_size, eps=1e-12)
+        self.c = args.c // 2 + 1
+        self.sqrt_beta = nn.Parameter(torch.randn(1, 1, args.hidden_size))
+        self.use_residual = not getattr(args, 'abl_no_freq_residual', False)
+
+    def forward(self, input_tensor):
+        batch, seq_len, hidden = input_tensor.shape
+        x = torch.fft.rfft(input_tensor, dim=1, norm='ortho')
+        low_pass = x[:]
+        low_pass[:, self.c:, :] = 0
+        low_pass = torch.fft.irfft(low_pass, n=seq_len, dim=1, norm='ortho')
+        high_pass = input_tensor - low_pass
+        sequence_emb_fft = low_pass + (self.sqrt_beta**2) * high_pass
+
+        hidden_states = self.out_dropout(sequence_emb_fft)
+        if self.use_residual:
+            return self.LayerNorm(hidden_states + input_tensor)
+        return self.LayerNorm(hidden_states)
+
 try:
     from mamba_ssm import Mamba
     _MAMBA_AVAILABLE = True
@@ -109,7 +145,7 @@ class FreqMambaLayer(nn.Module):
         self.alpha = args.alpha
 
         if self.use_freq:
-            self.filter_layer = FrequencyLayer(args)
+            self.filter_layer = StudentFrequencyLayer(args)
 
         self.mamba = Mamba(
             d_model=args.hidden_size,

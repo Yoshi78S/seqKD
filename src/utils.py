@@ -156,9 +156,50 @@ def parse_args():
                              "shuffled / pairgate_shuf = kappa permuted within batch (placebo).")
     parser.add_argument("--lambda_rep", default=0.0, type=float,
                         help="weight of L_rep (0 -> identical to pure PL baseline).")
+    # tau-gated PL (kd_mode=pl_taugate): source modulation of the PL channel.
+    # L = L_rec + lambda_kd * (1/B) sum_b tau~_b * PL_b, tau = (1-kappa)^gamma,
+    # tau~ globally normalized to train-set mean 1 (normalizer from one init pass).
+    parser.add_argument("--tau_mode", default="none",
+                        choices=["none", "kappa", "d_only", "shuffled"],
+                        help="none(tau==1, == pure PL); kappa = (1-kappa)^gamma (main); "
+                             "d_only = (1-d)^gamma confidence-gate control; "
+                             "shuffled = within-batch permuted kappa placebo.")
+    parser.add_argument("--tau_gamma", default=1.0, type=float,
+                        help="gate strength gamma >= 1.")
+    # pi~-PL repair distillation (kd_mode=pl_repair): kappa-conditional EDIT of the
+    # teaching content. Rows with kappa >= tau get pi~ = top-K(z~) where
+    # h~ = h - min(c*kappa,.95)*(h.e_l)*e_l (D5 strength law); others keep pi.
+    parser.add_argument("--gate_mode", default="none",
+                        choices=["none", "kappa", "shuffled", "rand_dir"],
+                        help="none(m==0, == pure PL); kappa = gate on own kappa (main); "
+                             "shuffled = fixed train-set permutation of kappa, keyed by "
+                             "(user,len) (placebo); rand_dir = remove along a popularity-"
+                             "matched random item direction instead of e_l (P2 placebo).")
+    parser.add_argument("--gate_tau", default="q67", choices=["q33", "q67"],
+                        help="gate threshold = this quantile of the train kappa stream "
+                             "(measured in the init pass).")
+    parser.add_argument("--repair_c", default=1.0, type=float,
+                        help="repair strength multiplier c (D5: c=1 or 2).")
+    parser.add_argument("--perm_seed", default=777, type=int,
+                        help="seed of the fixed kappa permutation (shuffled) / partner "
+                             "assignment (rand_dir).")
+    # KDStudent v4 (kd_mode=v4): bipolar recency gate, privileged gate supervision.
+    # L = L_rec(z~) + lambda_kd*L_PL(z~;pi) + lambda_g*mean_supervised (g - t)^2,
+    # t = -0.9 if kappa>=q67(train), 0 if kappa<=q33(train), else unsupervised.
+    parser.add_argument("--v4_gate_mode", default="learned",
+                        choices=["learned", "free", "shuffled", "fixed_-1", "fixed_0"],
+                        help="learned = privileged kappa targets (main); free = lambda_g=0; "
+                             "shuffled = fixed train-set permutation of kappa targets; "
+                             "fixed_-1 / fixed_0 = constant-gate controls.")
+    parser.add_argument("--lambda_g", default=0.0, type=float,
+                        help="weight of the gate supervision loss.")
+    parser.add_argument("--v4_base", default="pl", choices=["pl", "kl"],
+                        help="distillation base: pl (adopted) or kl (lp/T from the KL "
+                             "baseline, pred-KD only; HS term not included).")
     parser.add_argument("--kd_mode", default="kl",
                         choices=["kl", "adaptive_rank", "adaptive_rank_v2",
-                                 "adaptive_rank_comp", "rank_naive", "cmi", "debias", "rep"],
+                                 "adaptive_rank_comp", "rank_naive", "cmi", "debias", "rep",
+                                 "pl_taugate", "pl_repair", "v4"],
                         help="kl = current KL pred-KD (+ optional HS-KD); "
                              "adaptive_rank = v1 (attention-temperature targets, deprecated); "
                              "adaptive_rank_v2 = pre/post-residual interpolation (diagnosed inert); "
@@ -278,6 +319,10 @@ def parse_args():
     parser.add_argument("--abl_no_freq", action="store_true",
                         help="v3 only: drop the frequency branch (pure Mamba; "
                              "alpha is ignored).")
+    parser.add_argument("--abl_no_freq_residual", action="store_true",
+                        help="v3 ablation: remove the FrequencyLayer's internal fixed "
+                             "residual (LN(filtered+x) -> LN(filtered)). Note the filter "
+                             "still passes beta^2*x (identity component).")
     parser.add_argument("--abl_mamba_residual", action="store_true",
                         help="v3 only: re-add the fixed `+ x` residual on the "
                              "Mamba branch (tests the residual-dominance claim).")

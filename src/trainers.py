@@ -1659,3 +1659,661 @@ class RepDistillTrainer(CMIDistillTrainer):
             wcsv.writerow(row)
         self.logger.info(f"REP finalize -> {csv_path}: {row}")
         return row
+
+
+class TauPLDistillTrainer(RepDistillTrainer):
+    """tau-gated PL: source modulation of the contaminated PL channel
+    (kd_mode=pl_taugate).
+
+        L = L_rec + lambda_kd * (1/B) sum_b tau~_b * PL_b
+
+    PL_b is byte-identical to the current listwise term per instance (same
+    teacher top-K gather, same suffix-logcumsumexp, same 1/K position mean) —
+    only the final batch-mean is replaced by a tau~-weighted mean. tau~ has
+    train-set mean 1 by construction: tau~ = tau / Z with Z = E_train[tau]
+    measured in ONE frozen-teacher pass at init (mathematically identical to
+    the spec's global normalization; instances are identified by content, not
+    cache index — teacher is deterministic in eval, verified S6 diff=0).
+
+    tau_mode:
+      none     : tau~ == 1, exact pure-PL gradients (S1 reference)
+      kappa    : tau = (1-kappa)^gamma, kappa = d*(1-a)  (main arm)
+      d_only   : tau = (1-d)^gamma  (confidence-gate control, ignores (1-a))
+      shuffled : kappa permuted WITHIN BATCH before tau (placebo; same weight
+                 distribution, zero information; train-set-wide fixed permutation
+                 is impossible without an instance index in train batches)
+    ell==0 rows (length-1 prefixes): kappa=d=0 -> tau=1 (neutral weight).
+    Eval untouched. Inherits rep_finalize (kappa-tercile / popularity HR).
+    """
+
+    def __init__(self, student_model, teacher_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args, logger):
+        args.rep_mode = 'none'                  # no L_rep channel here
+        super().__init__(student_model, teacher_model,
+                         train_dataloader, eval_dataloader, test_dataloader, args, logger)
+        self.tau_mode = getattr(args, 'tau_mode', 'none')
+        self.tau_gamma = getattr(args, 'tau_gamma', 1.0)
+        self.tau_Z = 1.0
+        if self.tau_mode != 'none':
+            self.tau_Z = self._measure_Z()
+        logger.info(f"TAUPL config: mode={self.tau_mode}, gamma={self.tau_gamma}, "
+                    f"Z={self.tau_Z:.6f}, base=PL(lam={self.lambda_kd},k={self.rank_k})")
+
+    @torch.no_grad()
+    def _measure_Z(self):
+        """One frozen-teacher pass over train: Z = mean(tau), plus S5 check."""
+        E_t = self.teacher.item_embeddings.weight
+        s = n = 0.0
+        mn, mx = float('inf'), -float('inf')
+        for batch in self.train_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            input_ids, answers = batch[1], batch[2]
+            tau = self._tau_raw(input_ids, answers, shuffle=False)
+            s += float(tau.sum()); n += tau.numel()
+            mn = min(mn, float(tau.min())); mx = max(mx, float(tau.max()))
+        Z = s / n
+        self.logger.info(f"TAUPL init pass: N={int(n)}, Z=mean(tau)={Z:.6f}, "
+                         f"tau range [{mn:.4f},{mx:.4f}], "
+                         f"tau~ range [{mn/Z:.4f},{mx/Z:.4f}]")
+        return Z
+
+    @torch.no_grad()
+    def _tau_raw(self, input_ids, answers, shuffle):
+        """Unnormalized tau for one batch (kappa or d_only signal)."""
+        E_t = self.teacher.item_embeddings.weight
+        h_t = self.teacher.predict(input_ids, None)[:, -1, :]
+        ell = input_ids[:, -1]
+        e_l = F.normalize(E_t[ell], dim=-1)
+        d = (F.normalize(h_t, dim=-1) * e_l).sum(-1).clamp(0, 1)
+        if self.tau_mode == 'd_only':
+            sig = d
+        else:                                   # kappa / shuffled
+            e_y = F.normalize(E_t[answers], dim=-1)
+            a = (e_l * e_y).sum(-1).clamp(0, 1)
+            sig = d * (1 - a)
+        sig = sig * (ell != 0).float()
+        if shuffle:
+            sig = sig[torch.randperm(sig.size(0), device=sig.device)]
+        return (1 - sig) ** self.tau_gamma
+
+    @staticmethod
+    def _pl_per_sample(student_ranked):
+        """Byte-identical inner computation of _plackett_luce_loss, per sample."""
+        flipped = torch.flip(student_ranked, dims=[1])
+        suffix_lse = torch.flip(torch.logcumsumexp(flipped, dim=1), dims=[1])
+        return (suffix_lse - student_ranked).mean(dim=1)              # [B]
+
+    def _compute_train_loss(self, batch):
+        user_ids, input_ids, answers, neg_answer, same_target = batch
+        E_s = self.model.item_embeddings.weight
+        h_s = self.model.predict(input_ids, user_ids)[:, -1, :]
+        logits = torch.matmul(h_s, E_s.transpose(0, 1))
+        l_rec = F.cross_entropy(logits, answers)
+        z_ord = self._teacher_logits(input_ids, user_ids)
+        k = min(self.rank_k, z_ord.size(1))
+        topk = torch.topk(z_ord, k, dim=1).indices
+        pl_b = self._pl_per_sample(torch.gather(logits, 1, topk))     # [B]
+        if self.tau_mode == 'none':
+            l_pl_w = pl_b.mean()
+            tau_t = None
+        else:
+            with torch.no_grad():
+                tau_t = self._tau_raw(input_ids, answers,
+                                      shuffle=(self.tau_mode == 'shuffled')) / self.tau_Z
+            assert not tau_t.requires_grad                            # S2
+            l_pl_w = (tau_t * pl_b).mean()
+        loss = l_rec + self.lambda_kd * l_pl_w
+
+        with torch.no_grad():
+            self._acc('l_rec', l_rec, 1)
+            self._acc('l_pl_w', l_pl_w, 1)
+            self._acc('l_pl_unw', pl_b.mean(), 1)                     # reference
+            if tau_t is not None:
+                self._acc('tau_mean', tau_t.mean(), 1)
+                self._acc('tau_min', tau_t.min(), 1)
+                self._acc('tau_max', tau_t.max(), 1)
+            ell = input_ids[:, -1]
+            ey = F.normalize(E_s[answers], dim=-1)
+            el = E_s[ell]
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            self._acc('leak', ((h_s * el_perp).sum(-1) ** 2).mean(), 1)
+        return loss
+
+    def train(self, epoch):
+        self._ep = {}
+        Trainer.train(self, epoch)
+        m = {k: (v[0] / v[1] if v[1] else float('nan')) for k, v in self._ep.items()}
+        self.logger.info(
+            f"TAUPL epoch {epoch} L_rec={m.get('l_rec', float('nan')):.4f} "
+            f"PL_w={m.get('l_pl_w', float('nan')):.4f} "
+            f"PL_unw={m.get('l_pl_unw', float('nan')):.4f} "
+            f"tau~[{m.get('tau_min', float('nan')):.3f},{m.get('tau_max', float('nan')):.3f}] "
+            f"mean={m.get('tau_mean', float('nan')):.4f} "
+            f"leak={m.get('leak', float('nan')):.4f}")
+        self._ep_means = m
+
+    def valid(self, epoch):
+        scores, info = CMIDistillTrainer.valid(self, epoch)
+        if hasattr(self, '_ep_means'):
+            import csv as _csv
+            m = self._ep_means
+            row = {'epoch': epoch}
+            for k in ('l_rec', 'l_pl_w', 'l_pl_unw', 'tau_mean', 'tau_min',
+                      'tau_max', 'leak'):
+                row[k] = round(m.get(k, float('nan')), 6)
+            row['val_HR10'] = scores[2]
+            row['val_NDCG10'] = scores[3]
+            new = not os.path.exists(self._epoch_csv)
+            with open(self._epoch_csv, 'a', newline='') as f:
+                wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new: wcsv.writeheader()
+                wcsv.writerow(row)
+        return scores, info
+
+    def taupl_finalize(self, csv_path):
+        """rep_finalize (kappa-tercile / popularity HR) with taupl-mode labeling."""
+        self.rep_mode = f"taupl_{self.tau_mode}_g{self.tau_gamma}"
+        try:
+            return self.rep_finalize(csv_path)
+        finally:
+            self.rep_mode = 'none'
+
+
+class RepairPLTrainer(CMIDistillTrainer):
+    """pi~-PL repair distillation (kd_mode=pl_repair): kappa-conditional EDIT of
+    the PL teaching content.
+
+        L = L_rec + lambda_kd * L_PL(pi~)        (PL internals / lambda / K untouched)
+
+        m  = 1[kappa >= tau_kappa]               tau = train-stream quantile (init pass)
+        h~ = h - m * min(c*kappa, 0.95) * (h.e_l) * e_l     (D5 strength law)
+        pi~ = unmasked top-K(h~ @ E_t^T)         (same convention as the live pi)
+
+    Ungated rows: h~ = h -> pi~ = pi -> loss bitwise-identical to baseline.
+    gate_mode: none / kappa (main) / shuffled (fixed train-set permutation of
+    kappa, keyed by (user_id, real_len) — a unique instance key under prefix
+    expansion; both gate and strength use the permuted kappa, direction e_l and
+    p stay own) / rand_dir (direction = popularity-matched fixed random partner
+    of ell; gate/strength own kappa; P2 placebo).
+    Guardrail (route2): h~ is used ONLY to build the teacher list — never as a
+    student operating point, representation target, or in eval.
+    kappa needs y (train-only); pi~ construction itself does not use y.
+    """
+
+    def __init__(self, student_model, teacher_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args, logger):
+        args.cmi_estimator = 'none'
+        super().__init__(student_model, teacher_model,
+                         train_dataloader, eval_dataloader, test_dataloader, args, logger)
+        self.gate_mode = getattr(args, 'gate_mode', 'none')
+        self.gate_tau_name = getattr(args, 'gate_tau', 'q67')
+        self.repair_c = getattr(args, 'repair_c', 1.0)
+        self.perm_seed = getattr(args, 'perm_seed', 777)
+        self._ep = {}
+        self._epoch_csv = os.path.join(args.output_dir, '..', 'results',
+                                       f"{args.train_name}_epochs.csv")
+        os.makedirs(os.path.dirname(self._epoch_csv), exist_ok=True)
+        self.tau_q33 = self.tau_q67 = self.gate_tau = 0.0
+        self._kshuf = None
+        self._partner = None
+        if self.gate_mode != 'none':
+            self._init_pass()
+        logger.info(f"REPAIR config: gate={self.gate_mode}, tau={self.gate_tau_name}="
+                    f"{self.gate_tau:.4f} (q33={self.tau_q33:.4f}, q67={self.tau_q67:.4f}), "
+                    f"c={self.repair_c}, perm_seed={self.perm_seed}, "
+                    f"base=PL(lam={self.lambda_kd},k={self.rank_k})")
+
+    @torch.no_grad()
+    def _kappa_batch(self, input_ids, answers):
+        E_t = self.teacher.item_embeddings.weight
+        h = self.teacher.predict(input_ids, None)[:, -1, :]
+        ell = input_ids[:, -1]
+        e_l = F.normalize(E_t[ell], dim=-1)
+        d = (F.normalize(h, dim=-1) * e_l).sum(-1).clamp(0, 1)
+        a = (e_l * F.normalize(E_t[answers], dim=-1)).sum(-1).clamp(0, 1)
+        return h, ell, e_l, (d * (1 - a)) * (ell != 0).float()
+
+    @torch.no_grad()
+    def _init_pass(self):
+        """Train-stream kappa quantiles; fixed permutation table (shuffled);
+        popularity-matched partner map (rand_dir). Deterministic given seeds."""
+        keys, kaps = [], []
+        for batch in self.train_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            uid, input_ids, answers = batch[0], batch[1], batch[2]
+            _, _, _, kap = self._kappa_batch(input_ids, answers)
+            ln = (input_ids != 0).sum(1)
+            keys += [(int(u), int(l)) for u, l in zip(uid.cpu(), ln.cpu())]
+            kaps.append(kap.cpu().numpy())
+        kaps = np.concatenate(kaps)
+        self.tau_q33, self.tau_q67 = np.quantile(kaps, [1 / 3, 2 / 3])
+        self.gate_tau = self.tau_q33 if self.gate_tau_name == 'q33' else self.tau_q67
+        self.logger.info(f"REPAIR init pass: N={len(kaps)}, kappa mean={kaps.mean():.4f}, "
+                         f"q33={self.tau_q33:.4f}, q67={self.tau_q67:.4f}")
+        if self.gate_mode == 'shuffled':
+            order = np.argsort(np.array(keys, dtype=[('u', int), ('l', int)]),
+                               order=('u', 'l'))
+            rng = np.random.default_rng(self.perm_seed)
+            perm = rng.permutation(len(order))
+            self._kshuf = {keys[order[i]]: float(kaps[order[perm[i]]])
+                           for i in range(len(order))}
+            self.logger.info(f"REPAIR shuffled: fixed train-set permutation built "
+                             f"(N={len(self._kshuf)}, seed={self.perm_seed})")
+        if self.gate_mode == 'rand_dir':
+            from dataset import get_seq_dic
+            seq_dic, _, _ = get_seq_dic(self.args)
+            pop = np.zeros(self.args.item_size, dtype=np.int64)
+            for seq in seq_dic['user_seq']:
+                for it in seq[:-2]:
+                    pop[it] += 1
+            items = np.arange(1, self.args.item_size)
+            q1, q2 = np.quantile(pop[1:], [1 / 3, 2 / 3])
+            buckets = [items[pop[1:] <= q1], items[(pop[1:] > q1) & (pop[1:] <= q2)],
+                       items[pop[1:] > q2]]
+            rng = np.random.default_rng(self.perm_seed)
+            partner = np.arange(self.args.item_size)
+            for b in buckets:
+                partner[b] = rng.choice(b, size=len(b), replace=True)
+            self._partner = torch.from_numpy(partner).to(self.device)
+            self.logger.info(f"REPAIR rand_dir: popularity-matched partner map built "
+                             f"(seed={self.perm_seed})")
+
+    def _acc(self, key, val, n=1):
+        s, c = self._ep.get(key, (0.0, 0))
+        self._ep[key] = (s + float(val) * n, c + n)
+
+    def _compute_train_loss(self, batch):
+        user_ids, input_ids, answers, neg_answer, same_target = batch
+        E_s = self.model.item_embeddings.weight
+        h_s = self.model.predict(input_ids, user_ids)[:, -1, :]
+        logits = torch.matmul(h_s, E_s.transpose(0, 1))
+        l_rec = F.cross_entropy(logits, answers)
+
+        with torch.no_grad():
+            E_t = self.teacher.item_embeddings.weight
+            h, ell, e_l, kap = self._kappa_batch(input_ids, answers)
+            K = min(self.rank_k, E_t.size(0))
+            if self.gate_mode == 'none':
+                z_t = h @ E_t.T
+                pi = torch.topk(z_t, K, dim=1).indices
+                m = torch.zeros_like(kap)
+                churn = None
+            else:
+                k_eff, e_dir = kap, e_l
+                if self.gate_mode == 'shuffled':
+                    ln = (input_ids != 0).sum(1)
+                    k_eff = torch.tensor(
+                        [self._kshuf.get((int(u), int(l)), 0.0)
+                         for u, l in zip(user_ids.cpu(), ln.cpu())],
+                        device=h.device, dtype=h.dtype)
+                elif self.gate_mode == 'rand_dir':
+                    e_dir = F.normalize(E_t[self._partner[ell]], dim=-1)
+                m = (k_eff >= self.gate_tau).float()
+                p = (h * e_dir).sum(-1, keepdim=True)
+                h_rep = h - (m * (self.repair_c * k_eff).clamp(max=0.95)).unsqueeze(-1) * p * e_dir
+                z_rep = h_rep @ E_t.T
+                pi = torch.topk(z_rep, K, dim=1).indices
+                gm = m.bool()
+                if gm.any():
+                    pi0 = torch.topk((h @ E_t.T)[gm], K, dim=1).indices
+                    inter = (pi[gm].unsqueeze(2) == pi0.unsqueeze(1)).any(2).sum(1).float()
+                    churn = (1 - inter / (2 * K - inter)).mean()
+                else:
+                    churn = None
+            assert not pi.requires_grad and not m.requires_grad                 # S2
+
+        pl_b = TauPLDistillTrainer._pl_per_sample(torch.gather(logits, 1, pi))  # [B]
+        l_pl = pl_b.mean()                                  # == _plackett_luce_loss
+        loss = l_rec + self.lambda_kd * l_pl
+
+        with torch.no_grad():
+            self._acc('l_rec', l_rec, 1); self._acc('l_pl', l_pl, 1)
+            self._acc('gate_rate', m.mean(), 1)
+            if churn is not None:
+                self._acc('churn', churn, 1)
+            for nm, msk in (('lo', kap < self.tau_q33),
+                            ('mid', (kap >= self.tau_q33) & (kap < self.tau_q67)),
+                            ('hi', kap >= self.tau_q67)):
+                if msk.any():
+                    self._acc(f'pl_{nm}', pl_b[msk].mean(), int(msk.sum()))
+            ey = F.normalize(E_s[answers], dim=-1)
+            el_s = E_s[ell]
+            el_perp = el_s - (el_s * ey).sum(-1, keepdim=True) * ey
+            self._acc('leak', ((h_s * el_perp).sum(-1) ** 2).mean(), 1)
+        return loss
+
+    def train(self, epoch):
+        self._ep = {}
+        Trainer.train(self, epoch)
+        m = {k: (v[0] / v[1] if v[1] else float('nan')) for k, v in self._ep.items()}
+        self.logger.info(
+            f"REPAIR epoch {epoch} L_rec={m.get('l_rec', float('nan')):.4f} "
+            f"L_PL={m.get('l_pl', float('nan')):.4f} gate={m.get('gate_rate', float('nan')):.3f} "
+            f"churn={m.get('churn', float('nan')):.3f} "
+            f"PL[lo/mid/hi]={m.get('pl_lo', float('nan')):.3f}/"
+            f"{m.get('pl_mid', float('nan')):.3f}/{m.get('pl_hi', float('nan')):.3f} "
+            f"leak={m.get('leak', float('nan')):.4f}")
+        self._ep_means = m
+
+    def valid(self, epoch):
+        scores, info = CMIDistillTrainer.valid(self, epoch)
+        if hasattr(self, '_ep_means'):
+            import csv as _csv
+            m = self._ep_means
+            row = {'epoch': epoch}
+            for k in ('l_rec', 'l_pl', 'gate_rate', 'churn',
+                      'pl_lo', 'pl_mid', 'pl_hi', 'leak'):
+                row[k] = round(m.get(k, float('nan')), 6)
+            row['val_HR10'] = scores[2]
+            row['val_NDCG10'] = scores[3]
+            new = not os.path.exists(self._epoch_csv)
+            with open(self._epoch_csv, 'a', newline='') as f:
+                wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new: wcsv.writeheader()
+                wcsv.writerow(row)
+        return scores, info
+
+    # reuse RepDistillTrainer's finalize machinery via composition
+    def repair_finalize(self, csv_path):
+        rep = RepDistillTrainer.__new__(RepDistillTrainer)
+        rep.__dict__ = self.__dict__.copy()
+        rep.rep_mode = f"repair_{self.gate_mode}_{self.gate_tau_name}_c{self.repair_c}"
+        rep.lambda_rep = 0.0
+        return RepDistillTrainer.rep_finalize(rep, csv_path)
+
+
+class V4DistillTrainer(CMIDistillTrainer):
+    """KDStudent v4: bipolar recency gate with privileged gate supervision
+    (kd_mode=v4, model_type=kdstudent_v4).
+
+        L = L_rec(z~) + lambda_kd * L_PL(z~; pi) + lambda_g * L_gate
+        L_gate = mean over SUPERVISED rows of (g - t)^2
+        t = -0.9  if kappa >= q67(train)   (close the shortcut; G2' minus oracle)
+        t =  0    if kappa <= q33(train)   (don't touch)
+        (mid band and + side: unsupervised = free learning; G1 design change 2)
+
+    The gate is part of the model: eval/leak run on z~ unchanged in DEFINITION
+    (the model's readout simply is h~). kappa uses y -> train-only; the gate
+    INPUT is the 8 student-side features only (asserted: no privileged input).
+    v4_gate_mode: learned / free (lambda_g=0) / shuffled (fixed train-set
+    permutation of kappa via the (user,len) instance key, P1 machinery) /
+    fixed_-1 / fixed_0 (constant-gate controls).
+    v4_base: pl (adopted PL channel) or kl (pred-KL, lp/T of the KL baseline;
+    its small HS term is NOT included -- disclosed deviation).
+    """
+
+    KAPPA_Q = {"ML-1M": (0.2611, 0.3740), "Beauty": (0.1841, 0.3427),
+               "LastFM": (0.2639, 0.3736)}                       # P0 train quantiles
+
+    def __init__(self, student_model, teacher_model,
+                 train_dataloader, eval_dataloader, test_dataloader, args, logger):
+        args.cmi_estimator = 'none'
+        super().__init__(student_model, teacher_model,
+                         train_dataloader, eval_dataloader, test_dataloader, args, logger)
+        self.v4_gate_mode = getattr(args, 'v4_gate_mode', 'learned')
+        self.lambda_g = getattr(args, 'lambda_g', 0.0)
+        self.v4_base = getattr(args, 'v4_base', 'pl')
+        self.perm_seed = getattr(args, 'perm_seed', 777)
+        self.q33, self.q67 = self.KAPPA_Q[args.data_name]
+        if self.v4_gate_mode == 'fixed_-1':
+            self.model.gate_fix = -1.0
+        elif self.v4_gate_mode == 'fixed_0':
+            self.model.gate_fix = 0.0
+        self._kshuf = None
+        self._ep = {}
+        self._epoch_csv = os.path.join(args.output_dir, '..', 'results',
+                                       f"{args.train_name}_epochs.csv")
+        os.makedirs(os.path.dirname(self._epoch_csv), exist_ok=True)
+        self._calibrate()
+        logger.info(f"V4 config: gate={self.v4_gate_mode}, lambda_g={self.lambda_g}, "
+                    f"base={self.v4_base}, q33/q67={self.q33}/{self.q67}, "
+                    f"lam_kd={self.lambda_kd}, rank_k={self.rank_k}")
+
+    @torch.no_grad()
+    def _kappa_batch(self, input_ids, answers):
+        E_t = self.teacher.item_embeddings.weight
+        h = self.teacher.predict(input_ids, None)[:, -1, :]
+        ell = input_ids[:, -1]
+        e_l = F.normalize(E_t[ell], dim=-1)
+        d = (F.normalize(h, dim=-1) * e_l).sum(-1).clamp(0, 1)
+        a = (e_l * F.normalize(E_t[answers], dim=-1)).sum(-1).clamp(0, 1)
+        return (d * (1 - a)) * (ell != 0).float()
+
+    @torch.no_grad()
+    def _calibrate(self):
+        """P0: pop buffer, feature standardization (one deterministic train pass),
+        teaching-row rates, lambda_g scale points; shuffled permutation table."""
+        from dataset import get_seq_dic
+        seq_dic, _, _ = get_seq_dic(self.args)
+        pop = np.zeros(self.args.item_size, dtype=np.int64)
+        for seq in seq_dic['user_seq']:
+            for it in seq[:-2]:
+                pop[it] += 1
+        self.model.pop_log.copy_(torch.from_numpy(np.log1p(pop)).float().to(self.device))
+
+        self.model.eval()
+        s = s2 = None
+        n = 0
+        keys, kaps = [], []
+        for batch in self.train_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            uid, input_ids, answers = batch[0], batch[1], batch[2]
+            h = KDStudentV3ModelPredict(self.model, input_ids)          # pre-gate h
+            f = self.model.gate_features(h, input_ids)
+            s = f.sum(0) if s is None else s + f.sum(0)
+            s2 = (f ** 2).sum(0) if s2 is None else s2 + (f ** 2).sum(0)
+            n += f.size(0)
+            kap = self._kappa_batch(input_ids, answers)
+            kaps.append(kap.cpu().numpy())
+            ln = (input_ids != 0).sum(1)
+            keys += [(int(u), int(l)) for u, l in zip(uid.cpu(), ln.cpu())]
+        mu = s / n
+        sd = (s2 / n - mu ** 2).clamp_min(1e-12).sqrt().clamp_min(1e-6)
+        self.model.feat_mu.copy_(mu)
+        self.model.feat_sd.copy_(sd)
+        kaps = np.concatenate(kaps)
+        r_close = float((kaps >= self.q67).mean())
+        r_keep = float((kaps <= self.q33).mean())
+        self.logger.info(f"V4 calibrate: N={n}, feat_mu={[round(float(x),3) for x in mu]}, "
+                         f"teach rates: t=-0.9 {100*r_close:.1f}%  t=0 {100*r_keep:.1f}%")
+        # lambda_g scale: L_gate at g==0 ~= r_close/(r_close+r_keep)*0.81
+        l_gate0 = 0.81 * r_close / max(r_close + r_keep, 1e-9)
+        l_rec0 = 8.0  # refined below from one batch
+        batch = tuple(t.to(self.device) for t in next(iter(self.train_dataloader)))
+        h_full = self.model.predict(batch[1], batch[0])
+        z = h_full[:, -1, :] @ self.model.item_embeddings.weight.T
+        l_rec0 = float(F.cross_entropy(z, batch[2]))
+        self.logger.info(f"V4 lambda_g scale: L_rec(init)={l_rec0:.3f}, L_gate(g=0)={l_gate0:.3f} "
+                         f"-> lambda_g@10%={0.1*l_rec0/l_gate0:.2f}, @50%={0.5*l_rec0/l_gate0:.2f}")
+        if self.v4_gate_mode == 'shuffled':
+            order = np.argsort(np.array(keys, dtype=[('u', int), ('l', int)]),
+                               order=('u', 'l'))
+            rng = np.random.default_rng(self.perm_seed)
+            perm = rng.permutation(len(order))
+            self._kshuf = {keys[order[i]]: float(kaps[order[perm[i]]])
+                           for i in range(len(order))}
+            self.logger.info(f"V4 shuffled: permutation table N={len(self._kshuf)}, "
+                             f"seed={self.perm_seed}")
+        self.model.train()
+
+    def _acc(self, key, val, n=1):
+        s, c = self._ep.get(key, (0.0, 0))
+        self._ep[key] = (s + float(val) * n, c + n)
+
+    def _compute_train_loss(self, batch):
+        user_ids, input_ids, answers, neg_answer, same_target = batch
+        E_s = self.model.item_embeddings.weight
+        h_t = self.model.predict(input_ids, user_ids)[:, -1, :]       # gated h~
+        g = self.model.last_g
+        logits = torch.matmul(h_t, E_s.transpose(0, 1))               # z~
+        l_rec = F.cross_entropy(logits, answers)
+        z_teacher = self._teacher_logits(input_ids, user_ids)
+        if self.v4_base == 'pl':
+            l_kd = self._pl_term(logits, z_teacher)
+            loss = l_rec + self.lambda_kd * l_kd
+        else:                                                          # kl
+            T = self.kd_temperature
+            l_kd = F.kl_div(F.log_softmax(logits / T, dim=-1),
+                            F.softmax(z_teacher / T, dim=-1),
+                            reduction='batchmean') * (T * T)
+            loss = l_rec + self.lambda_kd * l_kd
+
+        l_gate = None
+        if self.lambda_g != 0.0 and self.v4_gate_mode in ('learned', 'shuffled'):
+            with torch.no_grad():
+                kap = self._kappa_batch(input_ids, answers)
+                if self.v4_gate_mode == 'shuffled':
+                    ln = (input_ids != 0).sum(1)
+                    kap = torch.tensor(
+                        [self._kshuf.get((int(u), int(l)), 0.0)
+                         for u, l in zip(user_ids.cpu(), ln.cpu())],
+                        device=g.device, dtype=g.dtype)
+                t = torch.where(kap >= self.q67, torch.full_like(kap, -0.9),
+                                torch.zeros_like(kap))
+                sup = (kap >= self.q67) | (kap <= self.q33)
+            assert not t.requires_grad and not sup.requires_grad      # S2
+            if sup.any():
+                l_gate = ((g[sup] - t[sup]) ** 2).mean()
+                loss = loss + self.lambda_g * l_gate
+                self._acc('sup_rate', sup.float().mean(), 1)
+
+        with torch.no_grad():
+            self._acc('l_rec', l_rec, 1); self._acc('l_kd', l_kd, 1)
+            if l_gate is not None:
+                self._acc('l_gate', l_gate, 1)
+            self._acc('g_mean', g.mean(), 1)
+            self._acc('g_neg', (g < -0.5).float().mean(), 1)
+            self._acc('g_pos', (g > 0.2).float().mean(), 1)
+            ell = input_ids[:, -1]
+            ey = F.normalize(E_s[answers], dim=-1)
+            el = E_s[ell]
+            el_perp = el - (el * ey).sum(-1, keepdim=True) * ey
+            self._acc('leak', ((h_t * el_perp).sum(-1) ** 2).mean(), 1)
+        return loss
+
+    def train(self, epoch):
+        self._ep = {}
+        Trainer.train(self, epoch)
+        m = {k: (v[0] / v[1] if v[1] else float('nan')) for k, v in self._ep.items()}
+        self.logger.info(
+            f"V4 epoch {epoch} L_rec={m.get('l_rec', float('nan')):.4f} "
+            f"L_kd={m.get('l_kd', float('nan')):.4f} L_gate={m.get('l_gate', float('nan')):.4f} "
+            f"sup={m.get('sup_rate', float('nan')):.3f} g_mean={m.get('g_mean', float('nan')):+.3f} "
+            f"g<-.5={m.get('g_neg', float('nan')):.3f} g>+.2={m.get('g_pos', float('nan')):.3f} "
+            f"leak={m.get('leak', float('nan')):.4f}")
+        self._ep_means = m
+
+    def valid(self, epoch):
+        scores, info = CMIDistillTrainer.valid(self, epoch)
+        if hasattr(self, '_ep_means'):
+            import csv as _csv
+            m = self._ep_means
+            row = {'epoch': epoch}
+            for k in ('l_rec', 'l_kd', 'l_gate', 'sup_rate', 'g_mean', 'g_neg',
+                      'g_pos', 'leak'):
+                row[k] = round(m.get(k, float('nan')), 6)
+            row['val_HR10'] = scores[2]
+            row['val_NDCG10'] = scores[3]
+            new = not os.path.exists(self._epoch_csv)
+            with open(self._epoch_csv, 'a', newline='') as f:
+                wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+                if new: wcsv.writeheader()
+                wcsv.writerow(row)
+        return scores, info
+
+    @torch.no_grad()
+    def v4_finalize(self, csv_path, v3_ckpt=None):
+        """Test metrics + kappa-tercile HR/HRLI + a x kappa 3x3 dHR vs the v3 PL
+        baseline ckpt (paired, same pass) + popularity buckets + realized gate
+        amortization (AUC of -g for kappa>=q67(train), corr(g, kappa))."""
+        import csv as _csv
+        from model import MODEL_DICT
+        self.model.eval()
+        E_s = self.model.item_embeddings.weight
+        E_t = self.teacher.item_embeddings.weight
+        trm = self.args.test_rating_matrix
+        v3 = None
+        if v3_ckpt and os.path.exists(v3_ckpt):
+            v3 = MODEL_DICT['kdstudent_v3'](args=self.args)
+            v3.load_state_dict(torch.load(v3_ckpt, map_location=self.device))
+            v3.to(self.device).eval()
+        acc = {k: [] for k in ('hit', 'nd', 'hrli', 'kap', 'a', 'g', 'hit3')}
+        for batch in self.test_dataloader:
+            batch = tuple(t.to(self.device) for t in batch)
+            uid, input_ids, answers, _, _ = batch
+            bidx = uid.cpu().numpy()
+            ell = input_ids[:, -1]
+            h = self.model.predict(input_ids, uid)[:, -1, :]
+            acc['g'].append(self.model.last_g.cpu().numpy())
+            z = h @ E_s.T
+            acc['hrli'].append((z.argmax(1) == ell).float().cpu().numpy())
+            rp = z.cpu().numpy().copy(); y = answers.cpu().numpy()
+            try: rp[trm[bidx].toarray() > 0] = 0
+            except Exception: rp = rp[:, :-1]; rp[trm[bidx].toarray() > 0] = 0
+            rk = (rp > rp[np.arange(len(rp)), y][:, None]).sum(1) + 1
+            acc['hit'].append((rk <= 10).astype(float))
+            acc['nd'].append(np.where(rk <= 10, 1 / np.log2(rk + 1), 0.0))
+            h_te = self.teacher.predict(input_ids, None)[:, -1, :]
+            e_l = F.normalize(E_t[ell], dim=-1)
+            d = (F.normalize(h_te, dim=-1) * e_l).sum(-1).clamp(0, 1)
+            a = (e_l * F.normalize(E_t[answers], dim=-1)).sum(-1).clamp(0, 1)
+            acc['a'].append(a.cpu().numpy())
+            acc['kap'].append((d * (1 - a)).cpu().numpy())
+            if v3 is not None:
+                h3 = v3.predict(input_ids, uid)[:, -1, :]
+                rp3 = (h3 @ v3.item_embeddings.weight.T).cpu().numpy().copy()
+                try: rp3[trm[bidx].toarray() > 0] = 0
+                except Exception: rp3 = rp3[:, :-1]; rp3[trm[bidx].toarray() > 0] = 0
+                rk3 = (rp3 > rp3[np.arange(len(rp3)), y][:, None]).sum(1) + 1
+                acc['hit3'].append((rk3 <= 10).astype(float))
+        A = {k: np.concatenate(v) for k, v in acc.items() if v}
+        kq1, kq2 = np.quantile(A['kap'], [1 / 3, 2 / 3])
+        aq1, aq2 = np.quantile(A['a'], [1 / 3, 2 / 3])
+        kt = [('lo', A['kap'] <= kq1), ('mid', (A['kap'] > kq1) & (A['kap'] <= kq2)),
+              ('hi', A['kap'] > kq2)]
+        row = {"dataset": self.args.data_name,
+               "mode": f"v4_{self.v4_gate_mode}_lg{self.lambda_g}_{self.v4_base}",
+               "HR@10": round(A['hit'].mean(), 4),
+               "NDCG@10": round(A['nd'].mean(), 4),
+               "HRLI@1": round(A['hrli'].mean(), 4)}
+        for nm, m in kt:
+            row[f"HR_k_{nm}"] = round(A['hit'][m].mean(), 4)
+            row[f"HRLI_k_{nm}"] = round(A['hrli'][m].mean(), 4)
+        ghi = A['kap'] >= self.q67
+        auc = float('nan')
+        if ghi.any() and (~ghi).any():
+            s = -A['g']
+            o = np.argsort(s); r = np.empty(len(s)); r[o] = np.arange(1, len(s) + 1)
+            n1, n0 = ghi.sum(), (~ghi).sum()
+            auc = (r[ghi].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)
+        row["gate_AUC"] = round(auc, 4)
+        row["corr_g_kappa"] = round(float(np.corrcoef(A['g'], A['kap'])[0, 1]), 4)
+        row["g_mean"] = round(float(A['g'].mean()), 4)
+        row["g_neg_rate"] = round(float((A['g'] < -0.5).mean()), 4)
+        self.logger.info("V4 a x kappa 3x3 dHR vs v3 baseline (rows a-lo/mid/hi, cols k-lo/mid/hi):")
+        if 'hit3' in A:
+            for anm, am in (('a-lo', A['a'] <= aq1),
+                            ('a-mid', (A['a'] > aq1) & (A['a'] <= aq2)),
+                            ('a-hi', A['a'] > aq2)):
+                cells = []
+                for knm, km in kt:
+                    msk = am & km
+                    cells.append(f"{(A['hit'][msk].mean() - A['hit3'][msk].mean()):+.4f}"
+                                 if msk.any() else "  --  ")
+                self.logger.info(f"  {anm:5s}: " + "  ".join(cells))
+            row["dHR_ahi_klo"] = round(
+                float(A['hit'][(A['a'] > aq2) & (A['kap'] <= kq1)].mean()
+                      - A['hit3'][(A['a'] > aq2) & (A['kap'] <= kq1)].mean()), 4)
+        new = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            wcsv = _csv.DictWriter(f, fieldnames=list(row.keys()))
+            if new: wcsv.writeheader()
+            wcsv.writerow(row)
+        self.logger.info(f"V4 finalize -> {csv_path}: {row}")
+        return row
+
+
+def KDStudentV3ModelPredict(model, input_ids):
+    """Pre-gate readout h of a v4 model (the v3 body's last-position state)."""
+    from model.kd_student_v3 import KDStudentV3Model
+    return KDStudentV3Model.predict(model, input_ids)[:, -1, :]

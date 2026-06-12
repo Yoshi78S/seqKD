@@ -1,3 +1,6 @@
+# --- Archive (historical output snapshots, not for VCS) ---
+archive/
+
 # --- Experiment outputs (heavy, machine-generated, not for VCS) ---
 src/output/
 output/

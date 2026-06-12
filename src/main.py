@@ -8,7 +8,8 @@ from trainers import (Trainer, DistillTrainer, HiddenStateDistillTrainer,
                       KDStudentDistillTrainer, AdaptiveRankingDistillTrainer,
                       AdaptiveRankingV2Trainer, AdaptiveRankingCompTrainer,
                       RankNaiveDistillTrainer, CMIDistillTrainer, DebiasDistillTrainer,
-                      RepDistillTrainer)
+                      RepDistillTrainer, TauPLDistillTrainer, RepairPLTrainer,
+                      V4DistillTrainer)
 from utils import EarlyStopping, check_path, set_seed, parse_args, set_logger, make_teacher_args
 from dataset import get_seq_dic, get_dataloder, get_rating_matrix
 
@@ -64,7 +65,28 @@ def main():
         teacher.load_state_dict(state)
         logger.info(f"[Teacher] {args.teacher_type} loaded from {args.teacher_ckpt}")
 
-        if getattr(args, 'kd_mode', 'kl') == 'rep':
+        if getattr(args, 'kd_mode', 'kl') == 'v4':
+            # KDStudent v4: bipolar recency gate + privileged gate supervision.
+            trainer = V4DistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'pl_repair':
+            # pi~-PL repair distillation: kappa-conditional edit of the PL list.
+            trainer = RepairPLTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'pl_taugate':
+            # tau-gated PL: per-instance source modulation of the PL channel.
+            trainer = TauPLDistillTrainer(
+                student, teacher,
+                train_dataloader, eval_dataloader, test_dataloader,
+                args, logger,
+            )
+        elif getattr(args, 'kd_mode', 'kl') == 'rep':
             # kappa-corrected relational distillation (PL base + lambda_rep*L_rep).
             trainer = RepDistillTrainer(
                 student, teacher,
@@ -206,6 +228,29 @@ def main():
         os.makedirs(res_dir, exist_ok=True)
         csv_path = os.path.join(res_dir, f"rep_{args.rep_mode}_{args.data_name}.csv")
         trainer.rep_finalize(csv_path)
+
+    # TAUPL: per-run row (HR/NDCG/HRLI + kappa-tercile & popularity-tercile HR).
+    if getattr(args, 'kd_mode', 'kl') == 'pl_taugate' and hasattr(trainer, 'taupl_finalize'):
+        res_dir = os.path.join(args.output_dir, '..', 'results')
+        os.makedirs(res_dir, exist_ok=True)
+        csv_path = os.path.join(res_dir, f"taupl_{args.tau_mode}_{args.data_name}.csv")
+        trainer.taupl_finalize(csv_path)
+
+    # REPAIR: per-run row (HR/NDCG/HRLI + kappa-tercile & popularity-tercile HR).
+    if getattr(args, 'kd_mode', 'kl') == 'pl_repair' and hasattr(trainer, 'repair_finalize'):
+        res_dir = os.path.join(args.output_dir, '..', 'results')
+        os.makedirs(res_dir, exist_ok=True)
+        csv_path = os.path.join(res_dir, f"repair_{args.gate_mode}_{args.data_name}.csv")
+        trainer.repair_finalize(csv_path)
+
+    # V4: per-run row (HR/NDCG/HRLI + kappa-terciles + a x kappa dHR + gate AUC).
+    if getattr(args, 'kd_mode', 'kl') == 'v4' and hasattr(trainer, 'v4_finalize'):
+        res_dir = os.path.join(args.output_dir, '..', 'results')
+        os.makedirs(res_dir, exist_ok=True)
+        csv_path = os.path.join(res_dir, f"v4_{args.v4_gate_mode}_{args.data_name}.csv")
+        trainer.v4_finalize(csv_path,
+                            v3_ckpt=os.path.join(args.output_dir,
+                                                 f"cmi_linear_{args.data_name}_b0.pt"))
 
 
 if __name__ == "__main__":
